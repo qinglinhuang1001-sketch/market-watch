@@ -1,0 +1,41 @@
+name: nightly-nav
+
+on:
+  schedule:
+    # 20:30 北京时间 = 12:30 UTC，工作日执行
+    - cron: "30 12 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-nav:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run nav fetch
+        run: python nav_fetch.py
+
+      - name: Commit nav if changed
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -d reports/nav ]; then git add -A reports/nav; fi
+          if git diff --cached --quiet; then
+            echo "No NAV changes."
+          else
+            git commit -m "nav: $(date -u +%F)"
+            git push
+          fi
