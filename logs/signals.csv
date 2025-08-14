@@ -1,0 +1,2 @@
+time,date,asset_type,code,name,signal,reason,price_or_nav,day_pct,from_high_pct,size_lots,size_amount,params
+2025-08-14 10:37:00,2025-08-14,FUND,022365,永赢科技智选C,buy,manual, , , , ,1800,{"note":"manual entry for C share"}
