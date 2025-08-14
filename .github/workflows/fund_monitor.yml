@@ -1,22 +1,44 @@
-name: Fund Monitor
+name: fund-monitor
 
 on:
   schedule:
-    - cron: "*/2 1-7 * * 1-5"  # 周一到周五，交易日假设9:30-15:00，这里1-7表示北京时间09-15（UTC换算）
-  workflow_dispatch:
+    # UTC 时间；对应北京时间：
+    # 01:30-03:30  →  09:30-11:30
+    # 05:00-07:00  →  13:00-15:00
+    - cron: "*/2 1-3 * * 1-5"
+    - cron: "*/2 5-7 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # 允许提交状态文件
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
-      - name: Install dependencies
+          python-version: "3.10"
+
+      - name: Install deps
         run: pip install requests
-      - name: Run script
+
+      - name: Run once
         env:
           SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
         run: python check_once.py
+
+      - name: Commit state if changed
+        run: |
+          if [[ -n "$(git status --porcelain .action_state.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .action_state.json
+            git commit -m "state: mark today done $(date -u +%F)"
+            git push
+          fi
