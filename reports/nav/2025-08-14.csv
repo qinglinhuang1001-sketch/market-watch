@@ -1,0 +1,7 @@
+type,code,name,date,value,pct,source
+FUND,022365,永赢科技智选C,,,,fetch_error
+FUND,006502,财通集成电路A,,,,fetch_error
+FUND,018956,中航机遇领航A,,,,fetch_error
+FUND,018994,中欧数字经济A,,,,fetch_error
+ETF,159399,现金流ETF,2025-08-14,1.085,-0.4587,sina_quote
+ETF,513530,港股红利ETF,2025-08-14,1.735,-0.459,sina_quote
