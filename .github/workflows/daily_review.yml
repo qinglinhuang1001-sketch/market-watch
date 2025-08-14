@@ -1,0 +1,40 @@
+name: daily-review
+
+on:
+  schedule:
+    # 15:10 北京时间 == 07:10 UTC，工作日执行
+    - cron: "10 7 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run daily review
+        env:
+          SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
+        run: python daily_review.py
+
+      - name: Commit reports if changed
+        run: |
+          if [[ -n "$(git status --porcelain reports logs)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add reports logs
+            git commit -m "daily report: $(date -u +%F)"
+            git push
+          fi
