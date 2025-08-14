@@ -31,10 +31,18 @@ jobs:
 
       - name: Commit reports if changed
         run: |
-          if [[ -n "$(git status --porcelain reports logs)" ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add reports logs
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 只在目录存在时再 add，避免 pathspec 报错
+          if [ -d reports ]; then git add -A reports; fi
+          if [ -d logs ]; then git add -A logs; fi
+
+          # 若没有暂存变更则直接退出
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
             git commit -m "daily report: $(date -u +%F)"
             git push
           fi
