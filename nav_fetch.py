@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, re, csv, datetime as dt, requests, json
+import os, re, csv, time, json, datetime as dt, requests
+from typing import Optional, Dict
 
-# ===== 你要跟踪的 6 个标的 =====
-# 4 只场外基金 + 2 只场内 ETF（如需增删，直接改这个列表）
+# ===== 跟踪标的 =====
 INSTRUMENTS = [
-    # 场外基金（官方净值）
-    {"code": "022365", "name": "永赢科技智选C",    "type": "FUND"},
-    {"code": "006502", "name": "财通集成电路A",    "type": "FUND"},
-    {"code": "018956", "name": "中航机遇领航A",  "type": "FUND"},
-    {"code": "018994", "name": "中欧数字经济A",  "type": "FUND"},
-    # 场内 ETF（收盘价）
-    {"code": "159399", "name": "现金流ETF",        "type": "ETF", "mq": "sz159399"},
-    {"code": "513530", "name": "港股红利ETF",      "type": "ETF", "mq": "sh513530"},
-    # 如需加军工ETF：{"code":"512810","name":"国防军工ETF","type":"ETF","mq":"sh512810"},
+    {"code": "022365", "name": "永赢科技智选C",  "type": "FUND"},
+    {"code": "006502", "name": "财通集成电路A",  "type": "FUND"},
+    {"code": "018956", "name": "中航机遇领航A","type": "FUND"},
+    {"code": "018994", "name": "中欧数字经济A","type": "FUND"},
+    {"code": "159399", "name": "现金流ETF",      "type": "ETF", "mq": "sz159399"},
+    {"code": "513530", "name": "港股红利ETF",    "type": "ETF", "mq": "sh513530"},
+    # 如需军工ETF：{"code":"512810","name":"国防军工ETF","type":"ETF","mq":"sh512810"},
 ]
 
 REPORT_DIR = "reports/nav"
@@ -21,51 +19,71 @@ REPORT_DIR = "reports/nav"
 def bj_today():
     return (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
 
-# ---- FUND: 东财 F10 历史净值（最新一条） ----
-# 旧接口，最稳定：返回 js 文本里带 <table>，我们用正则取第一行
-def fetch_fund_latest_nav(code: str):
+# ---------- 工具 ----------
+UA = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome/123 Safari/537.36"}
+def get(url, headers=None, retry=3, timeout=10, allow_status_error=False):
+    headers = {**UA, **(headers or {})}
+    last_err = None
+    for _ in range(retry):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if not allow_status_error:
+                r.raise_for_status()
+            return r
+        except Exception as e:
+            last_err = e
+            time.sleep(1.2)
+    raise last_err
+
+# ---------- FUND: 东财 F10 历史净值 最新一条 ----------
+def fetch_fund_latest_nav(code: str) -> Optional[Dict]:
     url = f"http://fund.eastmoney.com/f10/F10DataApi.aspx?type=lsjz&code={code}&page=1&per=1"
-    headers = {"Referer": f"http://fundf10.eastmoney.com/"}   # 需要一个 Referer 才稳
-    r = requests.get(url, headers=headers, timeout=10)
-    r.raise_for_status()
-    # 取出第一行 <tr> ... <td>日期</td><td>单位净值</td><td>累计净值</td><td>日涨跌幅</td>...
-    m = re.search(r"<table.*?>(.*?)</table>", r.text, re.S|re.I)
-    if not m:
-        return None
-    table = m.group(1)
-    rowm = re.search(r"<tr.*?>(.*?)</tr>", table, re.S|re.I)
-    if not rowm:
-        return None
-    tds = re.findall(r"<td.*?>(.*?)</td>", rowm.group(1), re.S|re.I)
-    # 期望：日期/单位净值/累计净值/日涨跌幅/申购/赎回/分红
-    date  = (tds[0] or "").strip()
-    unit  = (tds[1] or "").strip()
-    chg   = (tds[3] or "").strip().replace("%","")
+    # 旧接口需要 Referer 才更稳
     try:
-        unit_val = float(unit)
-    except:
-        unit_val = None
-    try:
-        chg_val = float(chg)
-    except:
-        chg_val = None
-    return {"date": date, "nav": unit_val, "pct": chg_val}
+        r = get(url, headers={"Referer":"http://fundf10.eastmoney.com/"}, retry=3, timeout=10, allow_status_error=True)
+        if r.status_code != 200:
+            return None
+        m = re.search(r"<table.*?>(.*?)</table>", r.text, re.S|re.I)
+        if not m:
+            return None
+        rowm = re.search(r"<tr.*?>(.*?)</tr>", m.group(1), re.S|re.I)
+        if not rowm:
+            return None
+        tds = re.findall(r"<td.*?>(.*?)</td>", rowm.group(1), re.S|re.I)
+        if len(tds) < 4:
+            return None
+        date = (tds[0] or "").strip()
+        unit = (tds[1] or "").strip()
+        chg  = (tds[3] or "").strip().replace("%","")
+        unit_val = float(unit) if unit not in ("", "--") else None
+        chg_val  = float(chg)  if chg  not in ("", "--") else None
+        return {"date": date, "nav": unit_val, "pct": chg_val}
+    except Exception:
+        return None
 
-# ---- ETF: 新浪行情收盘价/涨跌幅 ----
-def fetch_etf_close(mq_code: str):
+# ---------- ETF: 新浪行情 收盘价/涨跌幅 ----------
+def fetch_etf_close(mq_code: str) -> Optional[Dict]:
     url = f"https://hq.sinajs.cn/list={mq_code}"
-    headers = {"Referer":"https://finance.sina.com.cn","User-Agent":"Mozilla/5.0"}
-    r = requests.get(url, headers=headers, timeout=10)
-    r.encoding = "gbk"
-    parts = r.text.split('="')[-1].strip('";\n').split(',')
-    # parts: [0]=名称, [2]=昨收, [3]=今开/现价?（收盘后为最新价）
-    name = parts[0]
-    now  = float(parts[3] or 0)
-    prev = float(parts[2] or 0)
-    pct  = round((now - prev) / prev * 100, 4) if prev else None
-    return {"date": str(bj_today()), "close": now, "pct": pct, "name": name}
+    try:
+        r = get(url, headers={"Referer":"https://finance.sina.com.cn"}, retry=3, timeout=10, allow_status_error=True)
+        if r.status_code != 200:
+            return None
+        r.encoding = "gbk"
+        parts = r.text.split('="')[-1].strip('";\n').split(',')
+        # 兜底解析
+        name = parts[0] if len(parts) > 0 else mq_code
+        prev = float(parts[2]) if len(parts) > 2 and parts[2] not in ("", "0") else None
+        last = parts[3] if len(parts) > 3 else ""
+        try:
+            now = float(last) if last not in ("", "0") else None
+        except Exception:
+            now = None
+        pct = round((now - prev) / prev * 100, 4) if (now is not None and prev not in (None, 0)) else None
+        return {"date": str(bj_today()), "close": now, "pct": pct, "name": name}
+    except Exception:
+        return None
 
-def ensure_dir(path): os.makedirs(path, exist_ok=True)
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
 def main():
     ensure_dir(REPORT_DIR)
@@ -76,10 +94,15 @@ def main():
             d = fetch_fund_latest_nav(it["code"])
             if d:
                 rows.append([it["type"], it["code"], it["name"], d["date"], d["nav"], d["pct"], "eastmoney_f10"])
+            else:
+                rows.append([it["type"], it["code"], it["name"], "", "", "", "fetch_error"])
         else:
             d = fetch_etf_close(it["mq"])
-            rows.append([it["type"], it["code"], it["name"], d["date"], d["close"], d["pct"], "sina_quote"])
-    # 写 CSV
+            if d:
+                rows.append([it["type"], it["code"], it["name"], d["date"], d["close"], d["pct"], "sina_quote"])
+            else:
+                rows.append([it["type"], it["code"], it["name"], "", "", "", "fetch_error"])
+    # 一定写 CSV（即使部分失败）
     with open(outpath, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["type","code","name","date","value","pct","source"])
