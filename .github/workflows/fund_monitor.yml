@@ -1,0 +1,22 @@
+name: Fund Monitor
+
+on:
+  schedule:
+    - cron: "*/2 1-7 * * 1-5"  # 周一到周五，交易日假设9:30-15:00，这里1-7表示北京时间09-15（UTC换算）
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run script
+        env:
+          SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
+        run: python check_once.py
