@@ -50,8 +50,9 @@ def safe_float(x):
 
 # ---------- 方案A：东财移动端 JSON（最稳） ----------
 def fetch_fund_latest_nav_mob(code: str) -> Optional[Dict]:
+    # 请求更多记录，避免当日为空
     url = ("https://fundmobapi.eastmoney.com/FundMNewApi/FundMNHisNetListNew"
-           f"?FCODE={code}&pageIndex=1&pageSize=1&IsShareNet=1"
+           f"?FCODE={code}&pageIndex=1&pageSize=30&IsShareNet=1"
            "&appType=ttjj&plat=Iphone&product=EFund&version=6.5.9")
     try:
         r = requests.get(url, headers=UA_MOB, timeout=12)
@@ -59,21 +60,24 @@ def fetch_fund_latest_nav_mob(code: str) -> Optional[Dict]:
             return None
         j = r.json()
         datas = j.get("Datas") or []
-        if not datas:
-            return None
-        d = datas[0]
-        return {
-            "date": d.get("PDATE"),
-            "nav":  safe_float(d.get("NAV")),
-            "pct":  safe_float(d.get("NAVCHGRT")),  # 百分比数值，如 0.85
-            "source": "fundmobapi"
-        }
+        # 找到最近一个有净值的条目
+        for d in datas:
+            nav = safe_float(d.get("NAV"))
+            if nav is not None:
+                return {
+                    "date": d.get("PDATE"),
+                    "nav":  nav,
+                    "pct":  safe_float(d.get("NAVCHGRT")),  # 百分比数值，如 0.85
+                    "source": "fundmobapi"
+                }
+        return None
     except Exception:
         return None
 
 # ---------- 方案B：api.fund.eastmoney JSON ----------
 def fetch_fund_latest_nav_api(code: str) -> Optional[Dict]:
-    url = f"http://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex=1&pageSize=1&startDate=&endDate="
+    # 同样把 pageSize 放大
+    url = f"http://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex=1&pageSize=50&startDate=&endDate="
     hdr = {**UA_PC, "Referer":"http://fundf10.eastmoney.com/"}
     try:
         r = requests.get(url, headers=hdr, timeout=12)
@@ -81,14 +85,16 @@ def fetch_fund_latest_nav_api(code: str) -> Optional[Dict]:
             return None
         j = r.json()
         rows = (j.get("Data") or {}).get("LSJZList") or []
-        if not rows: return None
-        d = rows[0]
-        return {
-            "date": d.get("FSRQ"),
-            "nav":  safe_float(d.get("DWJZ")),
-            "pct":  safe_float(d.get("JZZZL")),
-            "source": "eastmoney_api"
-        }
+        for d in rows:
+            nav = safe_float(d.get("DWJZ"))
+            if nav is not None:
+                return {
+                    "date": d.get("FSRQ"),
+                    "nav":  nav,
+                    "pct":  safe_float(d.get("JZZZL")),
+                    "source": "eastmoney_api"
+                }
+        return None
     except Exception:
         return None
 
