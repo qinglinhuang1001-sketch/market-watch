@@ -1,7 +1,9 @@
 type,code,name,date,value,pct,source
-FUND,022365,永赢科技智选C,,,,fetch_error
-FUND,006502,财通集成电路A,,,,fetch_error
+FUND,022364,永赢科技智选A,2025-08-14,2.3863,-4.26,eastmoney_api
+FUND,022365,永赢科技智选C,2025-08-14,2.3745,-4.26,eastmoney_api
+FUND,006502,财通集成电路A,2025-08-14,2.6092,-3.73,eastmoney_api
 FUND,018956,中航机遇领航A,,,,fetch_error
-FUND,018994,中欧数字经济A,,,,fetch_error
-ETF,159399,现金流ETF,2025-08-15,1.088,0.2765,sina_quote
-ETF,513530,港股红利ETF,2025-08-15,1.733,-0.1153,sina_quote
+FUND,018994,中欧数字经济A,2025-08-14,2.1964,-2.99,eastmoney_api
+ETF,159399,现金流ETF,2025-08-15,1.093,0.7373,sina_quote
+ETF,513530,港股红利ETF,2025-08-15,1.728,-0.4035,sina_quote
+ETF,512810,国防军工ETF,2025-08-15,0.713,0.2813,sina_quote
