@@ -1,0 +1,74 @@
+name: nightly-review
+
+on:
+  schedule:
+    # UTC 12:30 = 北京 20:30 / 东京 21:30（可按需改成 13:30）
+    - cron: "30 12 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  run-nightly:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Fetch NAV & closes
+        run: |
+          set -e
+          python nav_fetch.py
+          echo "---- after nav_fetch.py ----"
+          ls -lah reports || true
+          ls -lah reports/nav || true
+
+      - name: Build daily review
+        env:
+          SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
+        run: |
+          set -e
+          python daily_review.py
+          echo "---- after daily_review.py ----"
+          ls -lah reports/daily || true
+
+      - name: Show staged changes (debug)
+        run: |
+          echo "---- git status ----"
+          git status --porcelain || true
+          echo "---- changed files ----"
+          git ls-files -m -o --exclude-standard || true
+
+      - name: Compute branch name
+        id: meta
+        run: echo "branch=bot/nightly-$(date -u +%F)" >> $GITHUB_OUTPUT
+
+      # ✅ 用 PR 提交变更，兼容受保护分支；无变更时自动跳过且不会失败
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "nightly review: $(date -u +%F)"
+          title: "nightly review $(date -u +%F)"
+          body: |
+            Auto-generated nightly review.
+            - NAV snapshot: reports/nav/$(date -u +%F).csv
+            - Daily report: reports/daily/$(date -u +%F).md
+          branch: ${{ steps.meta.outputs.branch }}
+          delete-branch: true
+          add-paths: |
+            reports/**
+            logs/**
