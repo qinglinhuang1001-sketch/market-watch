@@ -2,11 +2,20 @@ name: nightly-review
 
 on:
   schedule:
-    - cron: "0 13 * * *" # UTC 13:00 = Asia/Tokyo 22:00，每天晚上10点跑
-  workflow_dispatch:      # 手动触发
+    # UTC 12:30 = 北京 20:30 / 东京 21:30
+    - cron: "30 12 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: nightly-review
+  cancel-in-progress: true
 
 jobs:
-  fetch-nav-and-review:
+  run-nightly:
     runs-on: ubuntu-latest
 
     steps:
@@ -19,43 +28,50 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.10"
 
       - name: Install deps
-        run: |
-          pip install -r requirements.txt
+        run: pip install requests
 
-      - name: Fetch NAV
+      # 1) 抓净值/收盘价 → reports/nav/YYYY-MM-DD.csv
+      - name: Fetch NAV & closes
         run: |
-          python scripts/fetch_nav.py
+          python nav_fetch.py
+          echo "---- after nav_fetch.py ----"
+          ls -lah reports || true
+          ls -lah reports/nav || true
 
+      # 2) 生成日报 → reports/daily/YYYY-MM-DD.md
       - name: Build daily review
+        env:
+          SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
         run: |
-          python scripts/daily_review.py
+          python daily_review.py
+          echo "---- after daily_review.py ----"
+          ls -lah reports/daily || true
 
-      - name: Commit changes
+      # 3) 计算日期 & PR 分支名（供后面引用）
+      - name: Compute meta
+        id: meta
+        shell: bash
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          d=$(date -u +%F)
+          echo "date=$d"   >> $GITHUB_OUTPUT
+          echo "branch=bot/nightly-$d" >> $GITHUB_OUTPUT
 
-          git add reports/nav || true
-          git add reports/daily || true
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-
-          git commit -m "nightly review: $(date -u +%F)"
-
+      # 4) 创建 PR（不会直接 push 到 main；无变更自动跳过）
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: nightly review: ${{ github.run_id }}
-          title: "Nightly review ${{ github.run_id }}"
+          commit-message: "nightly review: ${{ steps.meta.outputs.date }}"
+          title: "nightly review ${{ steps.meta.outputs.date }}"
           body: |
-            This PR contains the nightly NAV data and review for $(date -u +%F).
-          branch: "auto/nightly-review"
+            Auto-generated nightly review.
+            - NAV snapshot: reports/nav/${{ steps.meta.outputs.date }}.csv
+            - Daily report: reports/daily/${{ steps.meta.outputs.date }}.md
+          branch: ${{ steps.meta.outputs.branch }}
           base: main
           delete-branch: true
+          add-paths: |
+            reports/**
+            logs/**
