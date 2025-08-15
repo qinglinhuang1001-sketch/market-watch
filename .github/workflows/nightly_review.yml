@@ -61,6 +61,7 @@ jobs:
 
       # 4) 创建 PR（不会直接 push 到 main；无变更自动跳过）
       - name: Create Pull Request
+        id: cpr
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: "nightly review: ${{ steps.meta.outputs.date }}"
@@ -75,3 +76,41 @@ jobs:
           add-paths: |
             reports/**
             logs/**
+
+      # ✅ 自动开启 Auto‑merge（SQUASH）
+      - name: Enable auto-merge for PR
+        if: ${{ steps.cpr.outputs.pull-request-number }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
+        run: |
+          set -e
+          OWNER="${REPO%/*}"
+          NAME="${REPO#*/}"
+          # 1) 通过 GraphQL 拿到 PR 的 node id
+          python - <<'PY'
+import json, os, sys, urllib.request
+token   = os.environ['GH_TOKEN']
+owner   = os.environ['OWNER'] if 'OWNER' in os.environ else os.environ['REPO'].split('/')[0]
+name    = os.environ['NAME']  if 'NAME'  in os.environ else os.environ['REPO'].split('/')[1]
+number  = int(os.environ['PR_NUMBER'])
+q = {
+  "query": "query($o:String!,$n:String!,$num:Int!){repository(owner:$o,name:$n){pullRequest(number:$num){id}}}",
+  "variables": {"o": owner, "n": name, "num": number}
+}
+req = urllib.request.Request("https://api.github.com/graphql",
+    data=json.dumps(q).encode(),
+    headers={"Authorization":"bearer "+token,"Content-Type":"application/json"})
+data = json.load(urllib.request.urlopen(req))
+prid = data["data"]["repository"]["pullRequest"]["id"]
+# 2) 启用 Auto-merge（SQUASH）
+m = {
+  "query": "mutation($id:ID!){enablePullRequestAutoMerge(input:{pullRequestId:$id,mergeMethod:SQUASH}){clientMutationId}}",
+  "variables": {"id": prid}
+}
+req = urllib.request.Request("https://api.github.com/graphql",
+    data=json.dumps(m).encode(),
+    headers={"Authorization":"bearer "+token,"Content-Type":"application/json"})
+print(json.load(urllib.request.urlopen(req)))
+PY
