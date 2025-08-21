@@ -1,369 +1,235 @@
 # -*- coding: utf-8 -*-
+"""
+check_once.py
+盘中轮询一次：
+- 读取 TOTAL_ASSETS 等配置（空/非法不崩）
+- 监控 512810 及 022364/006502/018956
+- 量能/回撤 触发买入提示（仅提示，不下单）
+- Server酱推送（可选）
+- 记录快照到 quotes/YYYY-MM-DD_HHMMSS.csv （避免冒号）
+"""
+
 import os
-import re
-import csv
-import json
 import time
+import json
 import math
-import glob
-import random
-import urllib.parse
-import datetime as dt
+import urllib.request
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import csv
 
-import requests
+# ----------------------------
+# 通用工具
+# ----------------------------
+def jp_now():
+    return datetime.now(tz=timezone(timedelta(hours=9)))
 
-# -----------------------------
-# 基础配置（可按需改）
-# -----------------------------
-CONFIG = {
-    "total_assets": float(os.getenv("TOTAL_ASSETS", "100000.0")),  # 总资产，缺省 10 万
-    "offense_pct": 0.10,     # 进攻仓 = 总资产的 10%
-    "etf_trade_pct_range": (0.03, 0.04),  # 单只 ETF 下单 = 进攻仓的 3%~4%
-    "signal_tag": "auto",    # 信号标签
-    "guard_scale": 0.30,     # 口径防错闸：与最近净值偏差>30% 丢弃
-}
+def safe_filename_ts():
+    # 避免冒号：用下划线和 HHMMSS
+    return jp_now().strftime("%Y-%m-%d_%H%M%S")
 
-# 标的清单（可迁到 yaml/json；为便于落地，直接内嵌）
-SYMBOLS = {
-    "funds": [
-        {"code": "022364", "name": "永赢科技智选A"},
-        {"code": "006502", "name": "财通集成电路产业股票A"},
-        {"code": "018956", "name": "中航机遇领航混合发起A"},
-    ],
-    "etfs": [
-        {"code": "512810", "name": "国防军工ETF", "market": "sh",
-         "pullback_window": (-8.0, -5.0),  # 从当日高点回撤区间（负值）
-         "vol_breakout": {"ma": 5, "factor": 1.8}},   # 放量突破阈值
-    ],
-}
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
 
-SCT_KEY = os.getenv("SCT_KEY", "").strip()  # 方糖气球 SCTKEY
+def get_total_assets(default="100000"):
+    raw = os.getenv("TOTAL_ASSETS")
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        cleaned = str(raw).replace("_", "").replace(",", "").strip()
+        return float(cleaned)
+    except Exception:
+        return float(default)
 
-# -----------------------------
-# 工具
-# -----------------------------
-ROOT = Path(".").resolve()
-LOG_DIR = ROOT / "logs"
-DATA_DIR = ROOT / "data"
-REPORTS_DIR = ROOT / "reports"
-
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-(REPORTS_DIR / "nav").mkdir(parents=True, exist_ok=True)
-(REPORTS_DIR / "quotes").mkdir(parents=True, exist_ok=True)
-
-def jst_now():
-    return dt.datetime.utcnow() + dt.timedelta(hours=9)
-
-def today_str():
-    return jst_now().strftime("%Y-%m-%d")
-
-def send_wechat(title, content):
-    """Server 酱推送；需要 secrets: SCT_KEY"""
-    if not SCT_KEY:
-        print("[WARN] SCT_KEY missing, skip push:", title)
+def notify_wechat(text: str, desp: str = ""):
+    sckey = os.getenv("SCKEY", "").strip()
+    if not sckey:
         return
-    url = f"https://sctapi.ftqq.com/{SCT_KEY}.send"
-    data = {"title": title, "desp": content}
     try:
-        r = requests.post(url, data=data, timeout=10)
-        print("[SCT] status:", r.status_code, r.text[:200])
-    except Exception as e:
-        print("[SCT] push error:", repr(e))
+        # Server酱新域名：sct.ftqq.com
+        url = f"https://sctapi.ftqq.com/{sckey}.send"
+        data = urllib.parse.urlencode({"title": text, "desp": desp}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            _ = resp.read()
+    except Exception:
+        pass
 
-def read_json(path, default):
+def http_get_json(url, headers=None, timeout=10):
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+def http_get_text(url, headers=None, timeout=10):
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+# ----------------------------
+# 数据源（免费/简易）
+# ----------------------------
+def get_etf_sina_quote(symbol: str):
+    """
+    新浪 A 股/ETF 实时：返回 dict
+    symbol 示例：'sh512810' 或 'sz159xxx'
+    文档：返回逗号分隔字符串，字段很多，这里取常用：
+    [0] 股票名称, [1] 今日开盘价, [2] 昨收, [3] 当前价, [8] 成交量(手), [9] 成交额(元)
+    """
+    url = f"https://hq.sinajs.cn/list={symbol}"
+    txt = http_get_text(url, headers={"Referer": "https://finance.sina.com.cn"})
+    # eg: var hq_str_sh512810="国防军工ETF,0.718,0.719,0.717,0.727,0.713,0.717,0.718,6830845,4903829.000, ...";
+    if "=" not in txt or "\"" not in txt:
+        return None
+    payload = txt.split("=", 1)[1].strip().strip(";")
+    payload = payload.strip("\"")
+    parts = payload.split(",")
+    if len(parts) < 10:
+        return None
+    name = parts[0]
+    open_ = float(parts[1] or 0)
+    preclose = float(parts[2] or 0)
+    price = float(parts[3] or 0)
+    high = float(parts[4] or 0)
+    low = float(parts[5] or 0)
+    volume_hand = float(parts[8] or 0)  # 手
+    amount = float(parts[9] or 0)       # 元
+    pct = 0.0
+    if preclose > 0:
+        pct = (price - preclose) / preclose * 100
+    return {
+        "name": name, "open": open_, "preclose": preclose, "price": price,
+        "high": high, "low": low, "volume_hand": volume_hand, "amount": amount,
+        "pct": pct
+    }
+
+def get_fund_estimate_eastmoney(code: str):
+    """
+    天天基金估值接口（JSONP），取估值涨跌和估算净值。
+    示例：https://fundgz.1234567.com.cn/js/006002.js?rt=...
+    返回：{"name":..., "gsz":估算净值, "gszzl":估算涨跌幅%}
+    """
+    url = f"https://fundgz.1234567.com.cn/js/{code}.js?rt={int(time.time()*1000)}"
+    txt = http_get_text(url, headers={"Referer": "https://fund.eastmoney.com"})
+    # jsonpgz({"fundcode":"006502","name":"财通集成电路产业股票A","gsz":"2.7722","gszzl":"-0.36","gztime":"2025-08-19 15:00"});
+    if "jsonpgz(" not in txt:
+        return None
+    js = txt.strip().lstrip("jsonpgz(").rstrip(");")
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return default
+        obj = json.loads(js)
+        name = obj.get("name", "")
+        gsz = float(obj.get("gsz") or 0.0)
+        gszzl = float(obj.get("gszzl") or 0.0)  # %
+        return {"name": name, "est_nav": gsz, "est_pct": gszzl}
+    except Exception:
+        return None
 
-def write_json(path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+# ----------------------------
+# 规则参数（可按需挪到 .env / Actions vars）
+# ----------------------------
+WATCH_ETF = "sh512810"       # 国防军工ETF
+FUND_CODES = ["022364", "006502", "018956"]  # 022364 永赢科技智选A、006502 财通集成电路A、018956 中航机遇领航A
 
-def guard_price_scale(new_price, last_nav, guard=CONFIG["guard_scale"]):
-    """口径防错闸：仅对 FUND 使用"""
-    if last_nav is None:
-        return True
-    if last_nav <= 0 or new_price is None or new_price <= 0:
-        return True
-    diff = abs(new_price - last_nav) / last_nav
-    if diff > guard:
+# ETF 波段：回撤阈值 & 量能突破
+ETF_DIP_MIN = -8.0   # -8%
+ETF_DIP_MAX = -5.0   # -5%
+ETF_VOL_MULT = 1.5   # 成交量相较近 N 次均值的倍数
+ETF_VOL_WINDOW = 20
+
+# 基金买入：估值回撤阈值（你可按基金特性分开）
+FUND_BUY_DIP = -2.0  # 例如估算跌到 -2% 附近，且在你的“预定区间”内
+
+# ----------------------------
+# 简单滑动窗口内存（Runner 生命周期内有效）
+# ----------------------------
+_VOL_CACHE = []  # 存最近 N 笔成交量（手）
+
+def vol_breakout(current_hand: float, win: int = ETF_VOL_WINDOW, mult: float = ETF_VOL_MULT) -> bool:
+    global _VOL_CACHE
+    _VOL_CACHE.append(float(current_hand))
+    if len(_VOL_CACHE) > win:
+        _VOL_CACHE = _VOL_CACHE[-win:]
+    if len(_VOL_CACHE) < win:
         return False
-    return True
+    base = sum(_VOL_CACHE[:-1]) / max(1, len(_VOL_CACHE)-1)
+    return base > 0 and (current_hand >= base * mult)
 
-# -----------------------------
-# FUND：净值/估值读取
-# -----------------------------
-def latest_nav_from_reports(code):
-    """
-    从 reports/nav/*.csv 读取最近日期的净值记录：
-    CSV 字段示例：type,code,name,date,value,pct,source
-    """
-    files = sorted((REPORTS_DIR / "nav").glob("*.csv"))
-    latest_row = None
-    for fp in reversed(files):
-        with open(fp, "r", encoding="utf-8") as f:
-            rd = csv.DictReader(f)
-            for row in rd:
-                if row.get("code") == code:
-                    latest_row = row
-                    break
-        if latest_row:
-            break
-    if latest_row:
-        try:
-            return {
-                "date": latest_row.get("date"),
-                "nav": float(latest_row.get("value")),
-                "pct": float(latest_row.get("pct")) if latest_row.get("pct") else None,
-                "source": latest_row.get("source"),
-            }
-        except:
-            pass
-    return None
-
-def eastmoney_fund_gz(code):
-    """
-    东财基金估值接口（仅观察用，不用于买卖口径）：
-    http://fundgz.1234567.com.cn/js/006502.js?rt=timestamp
-    返回：{name, gztime, gszzl(估算涨幅%), gszz(估算净值)}
-    """
-    url = f"http://fundgz.1234567.com.cn/js/{code}.js?rt={int(time.time()*1000)}"
-    try:
-        r = requests.get(url, timeout=8)
-        if r.status_code == 200 and "jsonpgz" in r.text:
-            # jsonpgz({"fundcode":"006502","name":"xxx","gszz":"2.77","gszzl":"-0.36","gztime":"2025-08-20 15:00"});
-            m = re.search(r"jsonpgz\((\{.*?\})\);", r.text)
-            if m:
-                obj = json.loads(m.group(1))
-                return {
-                    "name": obj.get("name"),
-                    "est": float(obj.get("gszz")) if obj.get("gszz") else None,
-                    "est_pct": float(obj.get("gszzl")) if obj.get("gszzl") else None,
-                    "time": obj.get("gztime"),
-                    "source": "eastmoney_est",
-                }
-    except Exception as e:
-        print("[EM gz] error", code, repr(e))
-    return None
-
-# -----------------------------
-# ETF：新浪实时行情 + 成交量历史
-# -----------------------------
-def fetch_sina_quote(market, code):
-    """
-    新浪简易行情：返回当日 open, preclose, now, high, low, volume(手), amount(元)
-    api: https://hq.sinajs.cn/list=sh512810
-    """
-    mkt_code = f"{market}{code}"
-    url = f"https://hq.sinajs.cn/list={mkt_code}"
-    try:
-        r = requests.get(url, timeout=6)
-        r.encoding = "gbk"
-        if r.status_code != 200:
-            return None
-        # v_sh512810="国防军工ETF,0.713,0.712,0.713,0.72,0.711, ... ,成交量(手),成交额,日期,时间,";
-        parts = r.text.split("=")
-        raw = parts[1].strip('";\n ')
-        arr = raw.split(",")
-        if len(arr) < 32:
-            return None
-        name = arr[0]
-        open_p = float(arr[1]) if arr[1] else None
-        preclose = float(arr[2]) if arr[2] else None
-        now_p = float(arr[3]) if arr[3] else None
-        high = float(arr[4]) if arr[4] else None
-        low = float(arr[5]) if arr[5] else None
-        vol_hand = float(arr[8]) if arr[8] else 0.0  # 手
-        amount = float(arr[9]) if arr[9] else 0.0
-        date = arr[-3]
-        tstr = arr[-2]
-        return {
-            "code": code, "market": market, "name": name,
-            "now": now_p, "open": open_p, "preclose": preclose,
-            "high": high, "low": low,
-            "vol": vol_hand * 100.0,   # 股
-            "amount": amount,
-            "date": date, "time": tstr,
-            "source": "sina_quote"
-        }
-    except Exception as e:
-        print("[SINA] error", code, repr(e))
-    return None
-
-VOL_FILE = DATA_DIR / "etf_vol_hist.csv"
-
-def append_etf_volume(code, date, vol):
-    VOL_FILE.parent.mkdir(parents=True, exist_ok=True)
-    exists = VOL_FILE.exists()
-    with open(VOL_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if not exists:
-            w.writerow(["date", "code", "vol"])
-        w.writerow([date, code, int(vol or 0)])
-
-def etf_vol_ma(code, ma=5):
-    if not VOL_FILE.exists():
-        return None
-    rows = []
-    with open(VOL_FILE, "r", encoding="utf-8") as f:
-        rd = csv.DictReader(f)
-        for row in rd:
-            if row["code"] == code:
-                rows.append((row["date"], int(row["vol"])))
-    rows.sort(key=lambda x: x[0])
-    rows = rows[-ma:]
-    if not rows:
-        return None
-    return sum(v for _, v in rows) / len(rows)
-
-# -----------------------------
-# 金额引擎
-# -----------------------------
-def offense_amount(total):
-    return total * CONFIG["offense_pct"]
-
-def etf_amount_range(total):
-    off = offense_amount(total)
-    a = off * CONFIG["etf_trade_pct_range"][0]
-    b = off * CONFIG["etf_trade_pct_range"][1]
-    return (round(a, 2), round(b, 2))
-
-def fund_split_amount(total, n):
-    off = offense_amount(total)
-    if n <= 0:
-        return 0.0
-    return round(off / n, 2)
-
-# -----------------------------
-# 去重日志（当天只提醒一次）
-# -----------------------------
-def has_sent(key):
-    path = LOG_DIR / f"signals-{today_str()}.json"
-    data = read_json(path, {"sent": []})
-    return key in data.get("sent", [])
-
-def mark_sent(key):
-    path = LOG_DIR / f"signals-{today_str()}.json"
-    data = read_json(path, {"sent": []})
-    if key not in data["sent"]:
-        data["sent"].append(key)
-        write_json(path, data)
-
-# -----------------------------
-# 触发逻辑
-# -----------------------------
-def check_funds():
-    """基金（场外）：只看净值/估值；触发=净值回撤窗口/或催化（此处先给净值回撤示例）"""
-    triggered = []
-    # 读取最后一次净值（从 reports/nav）
-    meta_list = []
-    for f in SYMBOLS["funds"]:
-        code = f["code"]
-        last = latest_nav_from_reports(code)
-        est = eastmoney_fund_gz(code)  # 估值，只做观察
-        meta_list.append({"code": code, "name": f["name"], "last": last, "est": est})
-
-    # 这里给一个“净值回撤窗口示例”：最近一次 pct <= -1% 即触发（可根据你的窗口改）
-    for m in meta_list:
-        code, name = m["code"], m["name"]
-        last = m["last"]
-        if not last:
-            continue
-        pct = last.get("pct")
-        nav = last.get("nav")
-        # 口径防错闸：估值（若有）与净值偏差>30%，不触发买卖，只发观察
-        if m["est"] and not guard_price_scale(m["est"]["est"], nav):
-            title = f"[OBSERVE] {code} {name} 估值口径异常"
-            msg = f"最近净值: {nav}({last.get('date')})；估值: {m['est']['est']}({m['est']['time']})；偏差过大，口径不一致，仅观察。"
-            send_wechat(title, msg)
-            continue
-
-        if pct is not None and pct <= -1.0:  # 示例阈值（你也可以改为你的区间）
-            triggered.append({"code": code, "name": name, "nav": nav, "pct": pct, "date": last["date"]})
-
-    # 金额建议：平分进攻仓
-    if triggered:
-        amt = fund_split_amount(CONFIG["total_assets"], len(triggered))
-        for t in triggered:
-            key = f"FUND-{t['code']}-{today_str()}"
-            if has_sent(key):
-                continue
-            title = f"BUY {t['code']} {t['name']}（FUND）"
-            msg = f"净值回撤触发：{t['pct']}%，净值={t['nav']}（{t['date']}）。\n建议额度≈¥{amt}（按总资产10%进攻仓平分）。"
-            send_wechat(title, msg)
-            mark_sent(key)
-
-def check_etfs():
-    """ETF：回撤区间 or 放量突破"""
-    for e in SYMBOLS["etfs"]:
-        code, name, market = e["code"], e["name"], e["market"]
-        q = fetch_sina_quote(market, code)
-        if not q or not q.get("now") or not q.get("high"):
-            print("[ETF] quote missing", code)
-            continue
-
-        # 记录今日成交量到历史表
-        append_etf_volume(code, today_str(), q["vol"])
-        vol_ma = etf_vol_ma(code, e["vol_breakout"]["ma"])
-
-        # 回撤：当前价相对今日高点的回撤
-        drawdown = (q["now"] - q["high"]) / q["high"] * 100.0 if q["high"] else None
-        pull_low, pull_high = e["pullback_window"]
-        cond_pull = (drawdown is not None) and (pull_low <= drawdown <= pull_high)  # drawdown 为负值
-
-        # 放量突破：当前累积量 > ma * factor
-        cond_vol = False
-        if vol_ma and vol_ma > 0:
-            cond_vol = q["vol"] > vol_ma * e["vol_breakout"]["factor"]
-
-        print(f"[ETF] {code} now={q['now']} high={q['high']} drawdown={drawdown:.2f}% vol={q['vol']:.0f} ma={vol_ma} cond_pull={cond_pull} cond_vol={cond_vol}")
-
-        if not (cond_pull or cond_vol):
-            continue
-
-        # 金额建议
-        lo, hi = etf_amount_range(CONFIG["total_assets"])
-        key = f"ETF-{code}-{today_str()}"
-        if has_sent(key):
-            continue
-
-        title = f"BUY {code} {name}（ETF）"
-        detail = []
-        if cond_pull:
-            detail.append(f"回撤落入区间[{pull_low}%, {pull_high}%]，当前回撤≈{drawdown:.2f}%")
-        if cond_vol:
-            detail.append(f"放量突破：vol≈{int(q['vol'])} > {e['vol_breakout']['factor']}×MA{e['vol_breakout']['ma']}≈{int(vol_ma or 0)}")
-        detail = "；".join(detail)
-
-        msg = (
-            f"{detail}\n"
-            f"现价≈{q['now']}，高点≈{q['high']}，昨收≈{q['preclose']}。\n"
-            f"建议下单额度：¥{lo} ~ ¥{hi}（进攻仓10%的3%~4%）。\n"
-            f"数据源：新浪。时间：{q['date']} {q['time']}。"
-        )
-        send_wechat(title, msg)
-        mark_sent(key)
-
-# -----------------------------
-# MAIN
-# -----------------------------
+# ----------------------------
+# 主逻辑
+# ----------------------------
 def main():
-    print("=== check_once.py start ===")
-    print("TODAY:", today_str())
-    print("TOTAL_ASSETS:", CONFIG["total_assets"])
+    total_assets = get_total_assets("100000")
+    pos_pct = float(os.getenv("POSITION_PCT", "0.10") or "0.10")   # 总资产 10% 为进攻仓上限
+    atk_pct = float(os.getenv("ATTACK_PCT", "0.035") or "0.035")   # 单笔 3.5%（你希望 3~4%）
+    atk_budget = total_assets * pos_pct * atk_pct
 
-    # FUND：净值/估值口径，不跑盘中量价
-    check_funds()
+    # 1) ETF 实时
+    etf = get_etf_sina_quote(WATCH_ETF)
+    etf_signal = None
+    if etf:
+        dip = etf["pct"]  # 相对昨收的涨跌幅
+        vol_ok = vol_breakout(etf["volume_hand"])
+        dip_ok = (ETF_DIP_MIN <= dip <= ETF_DIP_MAX)  # 在 -8%~-5% 区间
+        if dip_ok or vol_ok:
+            etf_signal = {
+                "type": "BUY",
+                "code": "512810",
+                "name": etf["name"],
+                "reason": "vol_breakout" if vol_ok and not dip_ok else "dip_zone" if dip_ok else "vol+dip",
+                "ref_price": etf["price"],
+                "ref_pct": dip,
+                "buy_suggest_cny": round(atk_budget, 2),
+            }
 
-    # ETF：盘中量价
-    check_etfs()
+    # 2) 场外基金估值
+    fund_signals = []
+    for code in FUND_CODES:
+        info = get_fund_estimate_eastmoney(code)
+        if not info:
+            continue
+        if info["est_pct"] <= FUND_BUY_DIP:
+            fund_signals.append({
+                "type": "BUY",
+                "code": code,
+                "name": info["name"],
+                "reason": "est_dip",
+                "ref_est_nav": info["est_nav"],
+                "ref_est_pct": info["est_pct"],
+                "buy_suggest_cny": round(total_assets * pos_pct * 0.10, 2),  # 例如进攻仓的 10% 用于单只基金
+            })
 
-    print("=== check_once.py done ===")
+    # 3) 输出快照 CSV（文件名无冒号）
+    quotes_dir = Path("quotes")
+    ensure_dir(quotes_dir)
+    out_path = quotes_dir / f"{safe_filename_ts()}.csv"
+    rows = []
+    now_str = jp_now().strftime("%Y-%m-%d %H:%M:%S")
+    if etf:
+        rows.append(["ETF", "512810", etf["name"], now_str, etf["price"], etf["pct"], etf["volume_hand"]])
+    for code in FUND_CODES:
+        info = get_fund_estimate_eastmoney(code)
+        if info:
+            rows.append(["FUND", code, info["name"], now_str, info["est_nav"], info["est_pct"], "NA"])
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["type", "code", "name", "time", "value_or_nav", "pct_or_estpct", "volume_hand"])
+        for r in rows:
+            w.writerow(r)
+
+    # 4) 通知（如有）
+    messages = []
+    if etf_signal:
+        messages.append(f"BUY 512810 {etf_signal['name']} | {etf_signal['reason']} | 参考价:{etf_signal['ref_price']:.3f} | 回撤:{etf_signal['ref_pct']:.2f}% | 金额≈¥{int(etf_signal['buy_suggest_cny'])}")
+    for s in fund_signals:
+        messages.append(f"BUY {s['code']} {s['name']} | {s['reason']} | 估值:{s.get('ref_est_nav', 0):.4f} | 回撤:{s.get('ref_est_pct', 0):.2f}% | 金额≈¥{int(s['buy_suggest_cny'])}")
+
+    if messages:
+        title = messages[0][:45]
+        body = "\n\n".join(messages) + f"\n\n快照: {out_path}"
+        print("[ALERT]\n" + body)
+        notify_wechat(title, body)
+    else:
+        print("no trigger. snapshot:", out_path)
 
 if __name__ == "__main__":
     main()
