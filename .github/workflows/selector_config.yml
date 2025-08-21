@@ -1,0 +1,34 @@
+# 候选基金池（场外 + 场内均可写代码）
+candidates:
+  - "022364"   # 永赢科技智选A
+  - "006502"   # 财通集成电路A
+  - "018956"   # 中航机遇领航A
+  - "159915"   # 创业板ETF
+  - "512810"   # 国防军工ETF
+  # 你可以继续添加…
+
+# 覆盖或补充关键字段（若接口拿不到/不准）
+overrides:
+  "022364":
+    manager_years: 1.0
+    fee_total: 1.20
+    scale_bil: 10.5
+    theme: "科技/通信"
+  "006502":
+    manager_years: 3.5
+    fee_total: 1.50
+    scale_bil: 20.0
+    theme: "半导体"
+  "018956":
+    manager_years: 2.0
+    fee_total: 1.40
+    scale_bil: 12.0
+    theme: "军工/航空"
+  "159915":
+    fee_total: 0.60
+    scale_bil: 450.0
+    theme: "创业板ETF"
+  "512810":
+    fee_total: 0.60
+    scale_bil: 150.0
+    theme: "国防军工ETF"
