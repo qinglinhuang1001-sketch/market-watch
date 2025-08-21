@@ -1,227 +1,275 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-分开输出：
-- 基金净值（场外）：reports/nav/<净值日期>.csv
-- ETF 行情（场内）：reports/quotes/<交易日期>.csv
+nav_fetch.py
+抓取：
+1) 场外基金最新净值（东财） -> reports/nav/YYYY-MM-DD.csv
+2) ETF 场内行情（新浪）   -> reports/quotes/YYYY-MM-DD.csv
 
-基金数据源：Eastmoney pingzhongdata
-ETF 数据源：新浪行情（hq.sinajs.cn）
-文件写入：幂等合并（同日重复运行只覆盖相同 code 的行）
-日志：逐标的抓取日志 + 错误 traceback + CSV 预览
+字段统一：
+- 基金净值：type,code,name,date,value,pct,source
+- ETF 行情：type,code,name,date,last,pct,source
+
+作者：你的量化小助手
 """
 
-import os
-import re
 import csv
-import json
-import sys
-import traceback
-import requests
-from collections import OrderedDict, Counter
+import os
+import time
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from typing import Tuple, List, Dict
 
-# ===== 配置 =====
-FUNDS: List[Dict[str, str]] = [
+import requests
+
+# -------------------------
+# 配置：跟踪标的
+# -------------------------
+FUNDS = [
     {"code": "022364", "name": "永赢科技智选A"},
     {"code": "006502", "name": "财通集成电路产业股票A"},
     {"code": "018956", "name": "中航机遇领航混合发起A"},
 ]
 
-# 你至少要跟踪 512810；另外两只按需保留/删除
-ETFS: List[Dict[str, str]] = [
-    {"code": "512810", "name": "国防军工ETF", "market": "sh"},  # 上交所
-    {"code": "159399", "name": "现金流ETF",   "market": "sz"},  # 深交所（可删）
-    {"code": "513530", "name": "港股红利ETF", "market": "sh"},  # 上交所（可删）
+# 仅保留你需要的 ETF；market 必选：上交所 sh / 深交所 sz
+ETFS = [
+    {"code": "512810", "name": "国防军工ETF", "market": "sh"},
+    # {"code": "159399", "name": "现金流ETF", "market": "sz"},
+    # {"code": "513530", "name": "港股红利ETF", "market": "sh"},
 ]
 
-OUT_NAV_DIR = Path("reports/nav")
-OUT_QT_DIR  = Path("reports/quotes")
-OUT_NAV_DIR.mkdir(parents=True, exist_ok=True)
-OUT_QT_DIR.mkdir(parents=True, exist_ok=True)
+# 时区：日本（与用户一致）
+JST = timezone(timedelta(hours=9))
 
-UA = {"User-Agent": "Mozilla/5.0"}
 
-# ===== 小工具 =====
-def bj_today_str() -> str:
-    return (datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
+# -------------------------
+# 工具函数
+# -------------------------
+def today_str_jst():
+    return datetime.now(JST).strftime("%Y-%m-%d")
 
-def _retry_get(url: str, headers=None, timeout: int = 12, n: int = 3) -> requests.Response:
-    last = None
-    for i in range(1, n + 1):
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def http_get(url, params=None, headers=None, retries=3, timeout=8):
+    """
+    简单 GET with retry
+    """
+    headers = headers or {}
+    last_err = None
+    for i in range(retries):
         try:
-            r = requests.get(url, headers=headers or UA, timeout=timeout)
-            r.raise_for_status()
-            return r
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            # 东财接口需要 200 且有 JSON
+            if resp.status_code == 200:
+                return resp
+            last_err = Exception(f"HTTP {resp.status_code}")
         except Exception as e:
-            last = e
-            print(f"[retry {i}/{n}] GET {url} failed: {e}")
-    raise last
+            last_err = e
+        time.sleep(1 + i)
+    raise last_err
 
-def _read_existing_as_map(out_path: Path) -> "OrderedDict[str, List[str]]":
-    mp: "OrderedDict[str, List[str]]" = OrderedDict()
-    if not out_path.exists():
-        return mp
-    with open(out_path, "r", encoding="utf-8") as f:
-        rdr = csv.reader(f)
-        for i, row in enumerate(rdr):
-            if i == 0:
-                continue
-            if len(row) >= 2:
-                mp[row[1]] = row  # code -> row
-    return mp
 
-def write_csv_merged(rows: List[List[str]], out_path: Path, header: List[str]) -> None:
-    existing = _read_existing_as_map(out_path)
-    for r in rows:
-        code = r[1]
-        existing[code] = r  # 覆盖/新增
-    with open(out_path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        for row in existing.values():
-            w.writerow(row)
+# -------------------------
+# 基金（东财）抓取
+# -------------------------
+def fetch_fund_latest_from_eastmoney(code: str):
+    """
+    通过东财历史净值接口取最新一条
+    接口： https://api.fund.eastmoney.com/f10/lsjz?fundCode=006502&pageIndex=1&pageSize=1
+    返回 JSON 中的 LSJZList 第一条：
+      FSRQ: 日期
+      DWJZ: 单位净值（str）
+      JZZZL: 当日涨跌幅 %（str，可能为空）
+    """
+    url = "https://api.fund.eastmoney.com/f10/lsjz"
+    params = {"fundCode": code, "pageIndex": 1, "pageSize": 1}
+    headers = {
+        # 东财接口通常需要一个 Referer 才返回 JSON
+        "Referer": "https://fundf10.eastmoney.com/",
+        "User-Agent": "Mozilla/5.0",
+    }
+    try:
+        r = http_get(url, params=params, headers=headers)
+        data = r.json()
+        # 结构容错
+        if not data or "Data" not in data or "LSJZList" not in data["Data"]:
+            return None
+        lst = data["Data"]["LSJZList"]
+        if not lst:
+            return None
+        row = lst[0]
+        date = row.get("FSRQ")  # 'YYYY-MM-DD'
+        value = row.get("DWJZ")  # 单位净值 str
+        pct = row.get("JZZZL", "")  # 当日涨跌幅 % str 可能为 ''
+        # 统一格式：value->float, pct->float(百分数)
+        try:
+            value = float(value)
+        except Exception:
+            value = None
+        try:
+            pct = float(pct)
+        except Exception:
+            pct = None
+        return {"date": date, "value": value, "pct": pct, "source": "eastmoney_api"}
+    except Exception:
+        return None
 
-# ===== 抓基金净值 =====
-def fetch_fund_last_nav(code: str) -> Tuple[str, float, float or str]:
-    url = f"https://fund.eastmoney.com/pingzhongdata/{code}.js"
-    r = _retry_get(url, headers=UA, timeout=12, n=3)
-    r.encoding = "utf-8"
-    txt = r.text
 
-    m = re.search(r"Data_netWorthTrend\s*=\s*(\[[\s\S]*?\])\s*;", txt)
-    if not m:
-        key = "Data_netWorthTrend"
-        idx = txt.find(key)
-        if idx < 0:
-            raise RuntimeError("no Data_netWorthTrend")
-        start = txt.find("[", idx)
-        end = txt.find("]", start) + 1
-        arr_txt = txt[start:end]
-    else:
-        arr_txt = m.group(1)
-
-    data = json.loads(arr_txt)
-    if not data:
-        raise RuntimeError("empty Data_netWorthTrend")
-
-    last = data[-1]
-    value = float(last.get("y"))
-    date = datetime.fromtimestamp(int(last["x"]) / 1000).strftime("%Y-%m-%d")
-
-    pct = last.get("equityReturn")
-    if pct in (None, ""):
-        if len(data) >= 2:
-            prev_val = float(data[-2]["y"])
-            pct = (value / prev_val - 1.0) * 100.0
-        else:
-            pct = ""
-
-    return date, value, pct
-
-# ===== 抓 ETF 行情（新浪） =====
-def fetch_etf_quote_sina(market: str, code: str) -> Tuple[str, float, float]:
-    symbol = f"{market}{code}"
-    url = f"https://hq.sinajs.cn/list={symbol}"
-    r = _retry_get(url, headers={"Referer": "https://finance.sina.com.cn/", **UA}, timeout=10, n=3)
-    r.encoding = "gbk"
-    txt = r.text.strip()
-    # var hq_str_sh512810="国防军工ETF,0.713,0.718,0.712,0.719,0.710,...,2025-08-19,15:00:01,00";
-    m = re.search(r'"([^"]+)"', txt)
-    if not m:
-        raise RuntimeError(f"sina quote parse error: {txt[:80]}")
-    parts = m.group(1).split(",")
-    if len(parts) < 4:
-        raise RuntimeError(f"sina fields too short: {len(parts)}")
-    last = float(parts[3])      # 当前/收盘价
-    yclose = float(parts[2])    # 昨收
-    date_str = parts[-3] if len(parts) >= 3 else bj_today_str()
-    pct = (last / yclose - 1.0) * 100.0 if yclose > 0 else 0.0
-    return date_str, last, pct
-
-# ===== 主流程 =====
-def run_once() -> None:
-    # 1) 基金净值 -> reports/nav/<净值日>.csv
-    fund_rows: List[List[str]] = []
-    nav_dates = []
+def build_fund_rows():
+    rows = []
     for f in FUNDS:
-        code = f["code"]; name = f["name"]
+        code, name = f["code"], f["name"]
+        item = fetch_fund_latest_from_eastmoney(code)
+        if item:
+            rows.append(
+                {
+                    "type": "FUND",
+                    "code": code,
+                    "name": name,
+                    "date": item["date"],
+                    "value": item["value"],
+                    "pct": item["pct"],
+                    "source": item["source"],
+                }
+            )
+        else:
+            # 拉取失败也保留一行，便于定位
+            rows.append(
+                {
+                    "type": "FUND",
+                    "code": code,
+                    "name": name,
+                    "date": today_str_jst(),
+                    "value": None,
+                    "pct": None,
+                    "source": "fetch_error",
+                }
+            )
+    return rows
+
+
+def save_fund_nav(rows):
+    ensure_dir("reports/nav")
+    # 以“最新一只基金的 date”为文件名；如果都失败，则用今天
+    dates = [r["date"] for r in rows if r.get("date")]
+    file_date = dates[0] if dates else today_str_jst()
+    path = f"reports/nav/{file_date}.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["type", "code", "name", "date", "value", "pct", "source"])
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"[FUND] saved -> {path}")
+
+
+# -------------------------
+# ETF（新浪）抓取
+# -------------------------
+def fetch_sina_quote(market: str, code: str):
+    """
+    新浪接口： https://hq.sinajs.cn/list=sh512810
+    返回：var hq_str_sh512810="国防军工,0.713,0.714,0.712,...";
+    字段含义见文档，这里取：
+      name: fields[0]
+      open: fields[1]
+      preclose: fields[2]
+      last: fields[3]  (实时/最新价)
+      ...
+    pct = (last - preclose) / preclose * 100
+    """
+    url = f"https://hq.sinajs.cn/list={market}{code}"
+    headers = {"Referer": "https://finance.sina.com.cn", "User-Agent": "Mozilla/5.0"}
+    try:
+        r = http_get(url, headers=headers)
+        text = r.text.strip()
+        # 容错
+        if "=" not in text or "," not in text:
+            return None
+        # 解析
+        # var hq_str_sh512810="国防军工,0.713,0.714,0.712,0.713,...";
+        info = text.split("=", 1)[1].strip().strip('";')
+        fields = info.split(",")
+        if len(fields) < 4:
+            return None
+        name = fields[0]
         try:
-            print(f"[fund] {code} {name} ...")
-            date, value, pct = fetch_fund_last_nav(code)
-            print(f"       -> date={date}, value={value}, pct={pct}")
-            nav_dates.append(date)
-            fund_rows.append(["FUND", code, name, date, f"{value:.4f}", f"{pct:.2f}" if pct != "" else "", "eastmoney_api"])
-        except Exception as e:
-            print(f"[fund][ERROR] {code} {name}: {e}")
-            fund_rows.append(["FUND", code, name, "", "", "fetch_error", "eastmoney_api"])
+            last = float(fields[3])
+        except Exception:
+            last = None
+        try:
+            preclose = float(fields[2])
+            pct = None if preclose == 0 else (last - preclose) / preclose * 100
+        except Exception:
+            pct = None
+        return {
+            "name": name if name else code,
+            "last": last,
+            "pct": pct,
+            "date": today_str_jst(),
+            "source": "sina_quote",
+        }
+    except Exception:
+        return None
 
-    nav_date = None
-    if nav_dates:
-        cnt = Counter([d for d in nav_dates if d])
-        if cnt:
-            nav_date = cnt.most_common(1)[0][0]
-    if not nav_date:
-        nav_date = bj_today_str()
 
-    nav_path = OUT_NAV_DIR / f"{nav_date}.csv"
-    write_csv_merged(fund_rows, nav_path, header=["type","code","name","date","value","pct","source"])
-    print(f"[write] funds => {nav_path}")
-
-    # 2) ETF 行情 -> reports/quotes/<交易日期>.csv
-    qt_rows: List[List[str]] = []
-    qt_dates = []
+def build_etf_rows():
+    rows = []
     for e in ETFS:
-        code = e["code"]; name = e["name"]; mkt = e["market"]
-        try:
-            print(f"[etf]  {code} {name} ...")
-            q_date, last, pct = fetch_etf_quote_sina(mkt, code)
-            print(f"       -> date={q_date}, last={last}, pct={pct}")
-            qt_dates.append(q_date)
-            qt_rows.append(["ETF", code, name, q_date, f"{last:.3f}", f"{pct:.4f}", "sina_quote"])
-        except Exception as e:
-            print(f"[etf][ERROR] {code} {name}: {e}")
-            qt_rows.append(["ETF", code, name, "", "", "fetch_error", "sina_quote"])
+        code, name, market = e["code"], e["name"], e["market"]
+        item = fetch_sina_quote(market, code)
+        if item:
+            rows.append(
+                {
+                    "type": "ETF",
+                    "code": code,
+                    "name": name or item["name"],
+                    "date": item["date"],
+                    "last": item["last"],
+                    "pct": item["pct"],
+                    "source": item["source"],
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "type": "ETF",
+                    "code": code,
+                    "name": name,
+                    "date": today_str_jst(),
+                    "last": None,
+                    "pct": None,
+                    "source": "fetch_error",
+                }
+            )
+    return rows
 
-    qt_date = None
-    if qt_dates:
-        cnt2 = Counter([d for d in qt_dates if d])
-        if cnt2:
-            qt_date = cnt2.most_common(1)[0][0]
-    if not qt_date:
-        qt_date = bj_today_str()
 
-    qt_path = OUT_QT_DIR / f"{qt_date}.csv"
-    write_csv_merged(qt_rows, qt_path, header=["type","code","name","date","last","pct","source"])
-    print(f"[write] etfs  => {qt_path}")
+def save_etf_quotes(rows):
+    ensure_dir("reports/quotes")
+    # ETF 用“当日交易日”命名；若都失败仍用今天
+    dates = [r["date"] for r in rows if r.get("date")]
+    file_date = dates[0] if dates else today_str_jst()
+    path = f"reports/quotes/{file_date}.csv"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["type", "code", "name", "date", "last", "pct", "source"])
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"[ETF ] saved -> {path}")
 
-    # 预览两份文件
-    def preview(p: Path, tag: str):
-        try:
-            print(f"===== preview {tag} =====")
-            with open(p, "r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    sys.stdout.write(line)
-                    if i > 20:
-                        print("... (truncated)")
-                        break
-            print("========================")
-        except Exception as e:
-            print(f"[preview][ERROR] {tag}: {e}")
 
-    preview(nav_path, "funds")
-    preview(qt_path,  "etfs")
-
+# -------------------------
+# Main
+# -------------------------
 def main():
-    run_once()
+    # 基金净值
+    fund_rows = build_fund_rows()
+    save_fund_nav(fund_rows)
+
+    # ETF 行情
+    etf_rows = build_etf_rows()
+    save_etf_quotes(etf_rows)
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("ERROR:", e)
-        traceback.print_exc()
-        sys.exit(1)
+    main()
