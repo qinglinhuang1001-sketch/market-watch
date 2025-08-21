@@ -1,0 +1,4 @@
+type,code,name,date,value,pct,source
+FUND,022364,永赢科技智选A,2025-08-20,2.5101,-0.87,eastmoney_api
+FUND,006502,财通集成电路产业股票A,2025-08-20,2.7722,-0.36,eastmoney_api
+FUND,018956,中航机遇领航混合发起A,2025-08-20,2.5095,-0.18,eastmoney_api
