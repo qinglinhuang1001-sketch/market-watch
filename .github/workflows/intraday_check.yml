@@ -3,15 +3,21 @@ name: intraday-check
 on:
   workflow_dispatch:
   schedule:
-    # 交易日早盘前触发（UTC，周一~周五）
-    - cron: '28 1 * * 1-5'
-    # 午盘前触发
-    - cron: '58 4 * * 1-5'
+    # 例：周一至周五，UTC 0:10~7:10 每小时触发一次；你已有 2min×30 的循环，够用了
+    - cron: "10 0-7 * * 1-5"
 
 jobs:
   run-check:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    permissions:
+      contents: read
+
+    env:
+      # 三层兜底：Secrets > Variables > 默认
+      TOTAL_ASSETS: ${{ secrets.TOTAL_ASSETS != '' && secrets.TOTAL_ASSETS || vars.TOTAL_ASSETS != '' && vars.TOTAL_ASSETS || '100000' }}
+      POSITION_PCT: ${{ vars.POSITION_PCT != '' && vars.POSITION_PCT || '0.10' }}   # 总资产里，用于“进攻仓”上限
+      ATTACK_PCT:   ${{ vars.ATTACK_PCT   != '' && vars.ATTACK_PCT   || '0.035' }}  # 单笔 3.5%（你设 3~4%）
+      SCKEY:        ${{ secrets.SCKEY }}  # Server酱，可为空
 
     steps:
       - name: Checkout repo
@@ -20,21 +26,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install -r requirements.txt || true
 
       - name: Intraday loop (2min × 30)
-        env:
-          SCT_KEY: ${{ secrets.SCT_KEY }}
-          TOTAL_ASSETS: ${{ secrets.TOTAL_ASSETS }}
         run: |
           echo "Start intraday loop at: $(date -u '+%F %T') UTC"
           for i in $(seq 1 30); do
-            echo "== iteration $i =="
-            python check_once.py
+            echo "== iteration ${i} =="
+            python check_once.py || true
             sleep 120
           done
