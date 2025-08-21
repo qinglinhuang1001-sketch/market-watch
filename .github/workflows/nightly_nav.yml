@@ -1,0 +1,89 @@
+name: nightly-nav
+
+on:
+  # 北京时间（CST, UTC+8）工作日 19:30 / 21:00 / 22:30 各跑一轮
+  schedule:
+    - cron: "30 11 * * 1-5"  # 19:30 CST
+    - cron: "00 13 * * 1-5"  # 21:00 CST
+    - cron: "30 14 * * 1-5"  # 22:30 CST
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: nightly-nav
+  cancel-in-progress: true
+
+jobs:
+  fetch-nav:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run nav fetch
+        run: |
+          python nav_fetch.py
+
+      # 找到本轮生成的 NAV 文件（取最后一个）
+      - name: Detect NAV_DATE
+        id: navdate
+        shell: bash
+        run: |
+          set -e
+          NAV_FILE=$(ls -1 reports/nav/*.csv | sort | tail -n1 || true)
+          if [ -z "$NAV_FILE" ]; then
+            echo "No NAV csv produced; skip PR."
+            echo "NAV_DATE=" >> $GITHUB_ENV
+            exit 0
+          fi
+          NAV_DATE=$(basename "$NAV_FILE" .csv)
+          echo "NAV_DATE=$NAV_DATE" >> $GITHUB_ENV
+          echo "Detected NAV file: $NAV_FILE"
+
+      # 以 PR 方式提交，避免直接 push main 的冲突
+      - name: Create Pull Request
+        if: env.NAV_DATE != ''
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          add-paths: |
+            reports/nav/*.csv
+          commit-message: "nav: ${{ env.NAV_DATE }} update"
+          title: "NAV update: ${{ env.NAV_DATE }}"
+          body: "Auto-created by nightly-nav workflow."
+          branch: "bot/nightly-${{ github.run_id }}"
+          base: "main"
+
+      # 开启 Auto‑merge（squash）
+      # 仓库需开启 Settings → General → Pull Requests → Enable auto-merge
+      - name: Enable PR Auto-merge (squash)
+        if: steps.cpr.outputs.pull-request-number != ''
+        uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
+          merge-method: squash
+
+      # 方便从 Actions 下载当轮 csv 进行核对
+      - name: Upload artifact (nav csv)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nav-${{ github.run_id }}
+          path: reports/nav/*.csv
+          if-no-files-found: ignore
