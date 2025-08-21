@@ -88,6 +88,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           add-paths: |
             reports/nav/*.csv
+            reports/quotes/*.csv   # ← 新增
             reports/daily/*.md
           commit-message: "nightly: NAV ${{ env.NAV_DATE }} & review ${{ env.REVIEW_DATE }}"
           title: "Nightly: NAV ${{ env.NAV_DATE }} & review ${{ env.REVIEW_DATE }}"
@@ -111,5 +112,6 @@ jobs:
           name: nightly-${{ github.run_id }}
           path: |
             reports/nav/*.csv
+            reports/quotes/*.csv    # ← 新增
             reports/daily/*.md
           if-no-files-found: ignore
