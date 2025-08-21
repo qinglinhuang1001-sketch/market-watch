@@ -1,0 +1,64 @@
+name: intraday-check
+
+on:
+  # UTC 02:00–06:50 对应上海 10:00–14:50（含你的 10:00–14:45 窗口）
+  # 采用 10 分钟一触发 + 工作流内循环 5 次（每次间隔 120s）≈ 2 分钟节奏
+  schedule:
+    - cron: "0,10,20,30,40,50 2-6 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intraday-check
+  cancel-in-progress: true
+
+jobs:
+  run-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install deps
+        run: pip install requests
+
+      # 可在这里设置你的总资产与阈值（也可移到仓库 Secrets 里）
+      - name: Set env
+        run: |
+          echo "TOTAL_ASSET=${TOTAL_ASSET:-100000}" >> $GITHUB_ENV
+          echo "SERVER_CHAN_KEY=${SERVER_CHAN_KEY:-}" >> $GITHUB_ENV
+        env:
+          TOTAL_ASSET: ${{ secrets.TOTAL_ASSET }}   # 建议在仓库 Settings → Secrets 配置
+          SERVER_CHAN_KEY: ${{ secrets.SERVER_CHAN_KEY }}
+
+      # 10 分钟内循环跑 5 次，每次间隔 120s ≈ 2 分钟节奏
+      - name: Intraday loop (5 x 2min)
+        shell: bash
+        run: |
+          set -e
+          echo "Start intraday loop at: $(date -u)"
+          for i in {1..5}; do
+            echo "== iteration $i =="
+            python check_once.py || true
+            # 提前结束：若已过 06:45 UTC（即沪市 14:45）则不再等待
+            NOW_MIN=$(date -u +%H%M)
+            if [ "$NOW_MIN" -ge "0645" ]; then
+              echo "Window end reached (>=06:45 UTC), break."
+              break
+            fi
+            # 最后一次不再 sleep
+            if [ $i -lt 5 ]; then
+              sleep 120
+            fi
+          done
+          echo "Done at: $(date -u)"
