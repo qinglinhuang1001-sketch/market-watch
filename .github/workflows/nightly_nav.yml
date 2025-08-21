@@ -103,6 +103,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
           merge-method: squash
+          continue-on-error: true   
 
       # ⑥ 产物：本轮 NAV CSV + 日报 MD
       - name: Upload artifacts
