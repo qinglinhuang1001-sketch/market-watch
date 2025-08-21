@@ -3,7 +3,7 @@ name: nightly-suite
 on:
   workflow_dispatch:
   schedule:
-    # 东京时间 20:05 运行（UTC 要 -9h）
+    # 东京时间 20:05（UTC 11:05）
     - cron: "5 11 * * *"
 
 permissions:
@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout repo
-      - uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,7 +43,6 @@ jobs:
           .venv/bin/python nav_fetch.py
           echo "Done nav_fetch at $(date -u '+%F %T') UTC"
 
-      # （可选）上传生成的 csv/md 工件，供 Actions 页面下载
       - name: Upload artifacts (optional)
         if: always()
         uses: actions/upload-artifact@v4
@@ -55,7 +54,6 @@ jobs:
           if-no-files-found: ignore
           compression-level: 6
 
-      # 生成 PR 分支并提交
       - name: Create Pull Request
         id: cpr
         uses: peter-evans/create-pull-request@v6
@@ -68,7 +66,6 @@ jobs:
           signoff: false
           delete-branch: true
 
-      # 自动合并（如你仓库策略允许）。没有变更时此步会自然跳过。
       - name: Enable PR Auto-merge (squash)
         if: steps.cpr.outputs.pull-request-number != ''
         run: |
