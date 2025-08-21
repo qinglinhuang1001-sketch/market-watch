@@ -212,50 +212,62 @@ def fetch_sina_quote(market: str, code: str):
         return None
 
 
-def build_etf_rows():
+# -------------------------
+# ETF（新浪）抓取（加粗版）
+# -------------------------
+def build_etf_rows_safe():
     rows = []
-    for e in ETFS:
-        code, name, market = e["code"], e["name"], e["market"]
-        item = fetch_sina_quote(market, code)
-        if item:
-            rows.append(
-                {
-                    "type": "ETF",
-                    "code": code,
-                    "name": name or item["name"],
-                    "date": item["date"],
-                    "last": item["last"],
-                    "pct": item["pct"],
-                    "source": item["source"],
-                }
-            )
-        else:
-            rows.append(
-                {
-                    "type": "ETF",
-                    "code": code,
-                    "name": name,
-                    "date": today_str_jst(),
-                    "last": None,
-                    "pct": None,
-                    "source": "fetch_error",
-                }
-            )
+    print("[ETF ] start building etf rows, targets =", ETFS)
+    try:
+        for e in ETFS:
+            code, name, market = e["code"], e["name"], e["market"]
+            item = fetch_sina_quote(market, code)
+            if item:
+                rows.append(
+                    {
+                        "type": "ETF",
+                        "code": code,
+                        "name": name or item["name"],
+                        "date": item["date"],
+                        "last": item["last"],
+                        "pct": item["pct"],
+                        "source": item["source"],
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "type": "ETF",
+                        "code": code,
+                        "name": name,
+                        "date": today_str_jst(),
+                        "last": None,
+                        "pct": None,
+                        "source": "fetch_error",
+                    }
+                )
+    except Exception as e:
+        # 不让异常中断；写一行提示
+        print("[ETF ] build_etf_rows_safe error:", repr(e))
+    print("[ETF ] built rows num =", len(rows))
     return rows
 
 
-def save_etf_quotes(rows):
+def save_etf_quotes_force(rows):
     ensure_dir("reports/quotes")
-    # ETF 用“当日交易日”命名；若都失败仍用今天
-    dates = [r["date"] for r in rows if r.get("date")]
+    # 再保险：即便 rows 为空，也要写一个今日空表（至少创建目录 + 文件）
+    dates = [r.get("date") for r in rows if r.get("date")]
     file_date = dates[0] if dates else today_str_jst()
     path = f"reports/quotes/{file_date}.csv"
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["type", "code", "name", "date", "last", "pct", "source"])
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-    print(f"[ETF ] saved -> {path}")
+    try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["type", "code", "name", "date", "last", "pct", "source"])
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+        print(f"[ETF ] saved -> {path} (rows={len(rows)})")
+    except Exception as e:
+        print("[ETF ] save_etf_quotes_force error:", repr(e))
 
 
 # -------------------------
@@ -266,10 +278,9 @@ def main():
     fund_rows = build_fund_rows()
     save_fund_nav(fund_rows)
 
-    # ETF 行情
-    etf_rows = build_etf_rows()
-    save_etf_quotes(etf_rows)
-
+    # ETF 行情（强制落地）
+    etf_rows = build_etf_rows_safe()
+    save_etf_quotes_force(etf_rows)
 
 if __name__ == "__main__":
     main()
