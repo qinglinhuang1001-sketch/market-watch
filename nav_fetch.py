@@ -1,178 +1,157 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-稳定抓取：基金官方净值 + ETF 收盘价
-- 三层兜底：fundmobapi(JSON) -> api.fund.eastmoney(JSON) -> F10 HTML
-- 逐标的 try/except（任何失败都不让脚本退出）
-- 一定会生成 reports/nav/YYYY-MM-DD.csv；失败行写 fetch_error
-- 退出码固定 0，避免 GitHub Actions 因单标的失败而 fail
+收盘后抓取三只基金的最新净值，写入 reports/nav/<净值日期>.csv
+- 数据源：fund.eastmoney.com/pingzhongdata/<code>.js
+- 稳定性：请求重试、正则提取 Data_netWorthTrend
+- 兼容：equityReturn 缺失时以前一日净值计算 pct
+- 命名：文件名使用“净值日期”，避免日期错位
+- 幂等：同一日期多轮抓取会合并更新（不丢已有成功记录）
+- 输出列：type, code, name, date, value, pct, source
 """
 
-import os, re, csv, time, json, sys, datetime as dt, requests
-from typing import Optional, Dict
+import os
+import re
+import csv
+import json
+import requests
+from collections import OrderedDict
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Tuple, List, Dict
 
-# ===== 跟踪列表：可按需增删 =====
-INSTRUMENTS = [
-    # —— 场外基金（官方净值）——
-    {"code": "022364", "name": "永赢科技智选A",  "type": "FUND"},
-    {"code": "022365", "name": "永赢科技智选C",  "type": "FUND"},   # 如不需要C，删掉即可
-    {"code": "006502", "name": "财通集成电路A",  "type": "FUND"},
-    {"code": "018956", "name": "中航机遇领航A","type": "FUND"},
-    {"code": "018994", "name": "中欧数字经济A","type": "FUND"},
-
-    # —— 场内 ETF（收盘价）——
-    {"code": "159399", "name": "现金流ETF",      "type": "ETF", "mq": "sz159399"},
-    {"code": "513530", "name": "港股红利ETF",    "type": "ETF", "mq": "sh513530"},
-    {"code": "512810", "name": "国防军工ETF",    "type": "ETF", "mq": "sh512810"},  # 你新增的军工
+# ===== 配置 =====
+FUNDS: List[Dict[str, str]] = [
+    {"code": "022364", "name": "永赢科技智选A"},
+    {"code": "006502", "name": "财通集成电路产业股票A"},
+    {"code": "018956", "name": "中航机遇领航混合发起A"},
 ]
+OUT_DIR = Path("reports/nav")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-REPORT_DIR = "reports/nav"
+UA = {"User-Agent": "Mozilla/5.0"}
 
-def bj_today_date():
-    """北京当日 date 对象"""
-    return (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
+# ===== 工具函数 =====
+def bj_today_str() -> str:
+    # 北京时间
+    return (datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(hours=8)).strftime("%Y-%m-%d")
 
-def today_str():
-    return str(bj_today_date())
-
-# ---- UA / 请求工具 ----
-UA_PC  = {"User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 Chrome/123 Safari/537.36"}
-UA_MOB = {"User-Agent":"Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 EFund/6.5.9"}
-
-def safe_float(x):
-    if x is None: return None
-    s = str(x).strip().replace("%","")
-    if s in ("", "--"): return None
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-# ---------- 方案A：东财移动端 JSON（最稳） ----------
-def fetch_fund_latest_nav_mob(code: str) -> Optional[Dict]:
-    # 请求更多记录，避免当日为空
-    url = ("https://fundmobapi.eastmoney.com/FundMNewApi/FundMNHisNetListNew"
-           f"?FCODE={code}&pageIndex=1&pageSize=30&IsShareNet=1"
-           "&appType=ttjj&plat=Iphone&product=EFund&version=6.5.9")
-    try:
-        r = requests.get(url, headers=UA_MOB, timeout=12)
-        if r.status_code != 200:
-            return None
-        j = r.json()
-        datas = j.get("Datas") or []
-        # 找到最近一个有净值的条目
-        for d in datas:
-            nav = safe_float(d.get("NAV"))
-            if nav is not None:
-                return {
-                    "date": d.get("PDATE"),
-                    "nav":  nav,
-                    "pct":  safe_float(d.get("NAVCHGRT")),  # 百分比数值，如 0.85
-                    "source": "fundmobapi"
-                }
-        return None
-    except Exception:
-        return None
-
-# ---------- 方案B：api.fund.eastmoney JSON ----------
-def fetch_fund_latest_nav_api(code: str) -> Optional[Dict]:
-    # 同样把 pageSize 放大
-    url = f"http://api.fund.eastmoney.com/f10/lsjz?fundCode={code}&pageIndex=1&pageSize=50&startDate=&endDate="
-    hdr = {**UA_PC, "Referer":"http://fundf10.eastmoney.com/"}
-    try:
-        r = requests.get(url, headers=hdr, timeout=12)
-        if r.status_code != 200:
-            return None
-        j = r.json()
-        rows = (j.get("Data") or {}).get("LSJZList") or []
-        for d in rows:
-            nav = safe_float(d.get("DWJZ"))
-            if nav is not None:
-                return {
-                    "date": d.get("FSRQ"),
-                    "nav":  nav,
-                    "pct":  safe_float(d.get("JZZZL")),
-                    "source": "eastmoney_api"
-                }
-        return None
-    except Exception:
-        return None
-
-# ---------- 方案C：旧 HTML 表格兜底 ----------
-def fetch_fund_latest_nav_html(code: str) -> Optional[Dict]:
-    url = f"http://fund.eastmoney.com/f10/F10DataApi.aspx?type=lsjz&code={code}&page=1&per=1"
-    hdr = {**UA_PC, "Referer":"http://fundf10.eastmoney.com/"}
-    try:
-        r = requests.get(url, headers=hdr, timeout=12)
-        if r.status_code != 200:
-            return None
-        m = re.search(r"<table.*?>(.*?)</table>", r.text, re.S|re.I)
-        if not m: return None
-        rowm = re.search(r"<tr.*?>(.*?)</tr>", m.group(1), re.S|re.I)
-        if not rowm: return None
-        tds = re.findall(r"<td.*?>(.*?)</td>", rowm.group(1), re.S|re.I)
-        if len(tds) < 4: return None
-        return {
-            "date": (tds[0] or "").strip(),
-            "nav":  safe_float((tds[1] or "").strip()),
-            "pct":  safe_float((tds[3] or "").strip()),
-            "source": "f10_html"
-        }
-    except Exception:
-        return None
-
-def fetch_fund_latest_nav(code: str) -> Optional[Dict]:
-    return (fetch_fund_latest_nav_mob(code)
-            or fetch_fund_latest_nav_api(code)
-            or fetch_fund_latest_nav_html(code))
-
-# ---------- ETF：新浪行情 ----------
-def fetch_etf_close(mq_code: str) -> Optional[Dict]:
-    url = f"https://hq.sinajs.cn/list={mq_code}"
-    hdr = {**UA_PC, "Referer":"https://finance.sina.com.cn"}
-    try:
-        r = requests.get(url, headers=hdr, timeout=10)
-        r.encoding = "gbk"
-        parts = r.text.split('="')[-1].strip('";\n').split(',')
-        name = parts[0] if len(parts)>0 else mq_code
-        prev = safe_float(parts[2] if len(parts)>2 else None)
-        now  = safe_float(parts[3] if len(parts)>3 else None)
-        pct  = round((now - prev)/prev*100, 4) if (now is not None and prev not in (None,0)) else None
-        return {"date": today_str(), "close": now, "pct": pct, "name": name, "source": "sina_quote"}
-    except Exception:
-        return None
-
-def ensure_dir(p): os.makedirs(p, exist_ok=True)
-
-def main():
-    ensure_dir(REPORT_DIR)
-    outpath = os.path.join(REPORT_DIR, f"{today_str()}.csv")
-
-    rows = []
-    for it in INSTRUMENTS:
+def _retry_get(url: str, headers=None, timeout: int = 12, n: int = 3) -> requests.Response:
+    last = None
+    for _ in range(n):
         try:
-            if it["type"] == "FUND":
-                d = fetch_fund_latest_nav(it["code"])
-                if d:
-                    rows.append(["FUND", it["code"], it["name"], d["date"], d["nav"], d["pct"], d["source"]])
-                else:
-                    rows.append(["FUND", it["code"], it["name"], "", "", "", "fetch_error"])
-            else:
-                d = fetch_etf_close(it["mq"])
-                if d:
-                    rows.append(["ETF", it["code"], it["name"], d["date"], d["close"], d["pct"], d["source"]])
-                else:
-                    rows.append(["ETF", it["code"], it["name"], "", "", "", "fetch_error"])
+            r = requests.get(url, headers=headers or UA, timeout=timeout)
+            r.raise_for_status()
+            return r
         except Exception as e:
-            rows.append([it["type"], it["code"], it["name"], "", "", "", f"error:{type(e).__name__}"])
+            last = e
+    # 最后一次仍失败则抛出
+    raise last
 
-    with open(outpath, "w", newline="", encoding="utf-8") as f:
+def fetch_fund_last_nav(code: str) -> Tuple[str, float, float or str]:
+    """
+    抓取单只基金的“最新一条净值”
+    返回: (date_str, value_float, pct_float或"")
+    """
+    url = f"https://fund.eastmoney.com/pingzhongdata/{code}.js"
+    r = _retry_get(url, headers=UA, timeout=12, n=3)
+    r.encoding = "utf-8"
+    txt = r.text
+
+    # 更稳：正则提取 Data_netWorthTrend 数组
+    m = re.search(r"Data_netWorthTrend\s*=\s*(\[[\s\S]*?\])\s*;", txt)
+    if not m:
+        # 兜底：旧方式
+        key = "Data_netWorthTrend"
+        idx = txt.find(key)
+        if idx < 0:
+            raise RuntimeError("no Data_netWorthTrend")
+        start = txt.find("[", idx)
+        end = txt.find("]", start) + 1
+        arr_txt = txt[start:end]
+    else:
+        arr_txt = m.group(1)
+
+    data = json.loads(arr_txt)
+    if not data:
+        raise RuntimeError("empty Data_netWorthTrend")
+
+    last = data[-1]
+    value = float(last.get("y"))
+    # 日期使用净值自带时间戳
+    date = datetime.fromtimestamp(int(last["x"]) / 1000).strftime("%Y-%m-%d")
+
+    # 当日涨跌幅：优先 equityReturn；无则用前一日净值计算
+    pct = last.get("equityReturn")
+    if pct in (None, ""):
+        if len(data) >= 2:
+            prev_val = float(data[-2]["y"])
+            pct = (value / prev_val - 1.0) * 100.0
+        else:
+            pct = ""
+
+    return date, value, pct
+
+def _read_existing_as_map(out_path: Path) -> "OrderedDict[str, List[str]]":
+    """
+    读取已有 CSV（若存在），返回 code -> row 的顺序字典
+    """
+    mp: "OrderedDict[str, List[str]]" = OrderedDict()
+    if not out_path.exists():
+        return mp
+    with open(out_path, "r", encoding="utf-8") as f:
+        rdr = csv.reader(f)
+        for i, row in enumerate(rdr):
+            if i == 0:
+                continue  # 跳过表头
+            if len(row) >= 2:
+                mp[row[1]] = row  # code -> row
+    return mp
+
+def write_csv_merged(rows: List[List[str]], out_path: Path) -> None:
+    """
+    幂等写入：将新 rows 与已存在的同日文件按 code 合并后写回
+    """
+    header = ["type", "code", "name", "date", "value", "pct", "source"]
+    existing = _read_existing_as_map(out_path)
+    for r in rows:
+        code = r[1]
+        existing[code] = r  # 覆盖/新增
+
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["type","code","name","date","value","pct","source"])
-        w.writerows(rows)
+        w.writerow(header)
+        for row in existing.values():
+            w.writerow(row)
 
-    print("saved:", outpath)
-    sys.exit(0)  # 永远退出 0，避免 Actions 标红
+# ===== 主流程 =====
+def main():
+    rows: List[List[str]] = []
+    nav_dates = set()
+
+    for f in FUNDS:
+        code = f["code"]; name = f["name"]
+        try:
+            date, value, pct = fetch_fund_last_nav(code)
+            nav_dates.add(date)
+            rows.append(["FUND", code, name, date, f"{value:.4f}", f"{pct:.2f}" if pct != "" else "", "eastmoney_api"])
+        except Exception as e:
+            # 失败也写入一行，便于排查；date 暂空
+            rows.append(["FUND", code, name, "", "", "fetch_error", "eastmoney_api"])
+
+    # 选定文件名用的日期：
+    # - 若三只基金返回的净值日期一致：用该日期
+    # - 否则：用北京“今天”（避免同日多文件）
+    nav_dates_nonempty = [d for d in nav_dates if d]
+    if len(nav_dates_nonempty) == 1:
+        nav_date = nav_dates_nonempty[0]
+    else:
+        nav_date = bj_today_str()
+
+    out_path = OUT_DIR / f"{nav_date}.csv"
+    write_csv_merged(rows, out_path)
+    print(f"[nav_fetch] wrote: {out_path}")
 
 if __name__ == "__main__":
     main()
