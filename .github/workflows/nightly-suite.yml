@@ -41,6 +41,15 @@ jobs:
         run: |
           echo ">>> python nav_fetch.py"
           python nav_fetch.py
+      
+      - name: Show reports tree (after fetch)
+        run: |
+          echo "=== tree of reports ==="
+          ls -lah reports || true
+          echo "=== tree of reports/nav ==="
+          ls -lah reports/nav || true
+          echo "=== tree of reports/quotes ==="
+          ls -lah reports/quotes || true
 
       # 读取“最新”基金净值日期（用于 PR 标题，不影响逻辑）
       - name: Detect NAV_DATE
