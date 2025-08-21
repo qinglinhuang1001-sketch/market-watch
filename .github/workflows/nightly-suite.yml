@@ -1,9 +1,9 @@
 name: nightly-suite
 
 on:
-  workflow_dispatch:   # 手动触发
+  workflow_dispatch:
   schedule:
-    - cron: "0 21 * * *"  # 每天 UTC 21 点触发 (北京时间 05:00)
+    - cron: "0 21 * * *"   # 每天 UTC 21 点触发 (北京时间 05:00)
 
 jobs:
   fetch-and-review:
@@ -18,9 +18,9 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install deps
+      - name: Install Python dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install requests pandas
 
       - name: Run nightly nav fetch + review
