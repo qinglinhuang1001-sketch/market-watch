@@ -1,18 +1,14 @@
 name: nightly-suite
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    # 每天 21:40 Asia/Tokyo 运行（= 12:40 UTC）
-    - cron: "40 12 * * *"
+    # 东京时间 20:05 运行（UTC 要 -9h）
+    - cron: "5 11 * * *"
 
 permissions:
-  contents: write         # 允许提交代码、创建分支
-  pull-requests: write    # 允许创建/自动合并 PR
-
-concurrency:
-  group: nightly-suite
-  cancel-in-progress: false
+  contents: write
+  pull-requests: write
 
 env:
   TZ: Asia/Tokyo
@@ -20,87 +16,62 @@ env:
 
 jobs:
   fetch-and-review:
-    name: fetch-and-review
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install deps
+      - name: Create venv & install deps
         run: |
+          python -m venv .venv
+          . .venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run nightly nav fetch + review
         id: run_fetch
         run: |
-          echo "Start nav_fetch.py at $(date -u +'%F %T') UTC"
-          python nav_fetch.py
-          echo "Done at $(date -u +'%F %T') UTC"
+          . .venv/bin/activate
+          echo "Start nav_fetch at $(date -u '+%F %T') UTC"
+          .venv/bin/python nav_fetch.py
+          echo "Done nav_fetch at $(date -u '+%F %T') UTC"
 
-      # 可选：把今天产出的 CSV/MD 打包为构件，方便从 Actions 页面下载核对
+      # （可选）上传生成的 csv/md 工件，供 Actions 页面下载
       - name: Upload artifacts (optional)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reports-$(date -u +%Y%m%d)
+          name: "reports-${{ github.run_id }}"
           path: |
-            reports/nav/*.csv
-            reports/daily/*.md
+            reports/nav/**/*.csv
+            reports/daily/**/*.md
           if-no-files-found: ignore
           compression-level: 6
 
-      # 仅当有变更才创建 PR（避免 “No commits between main and bot/nightly”）
+      # 生成 PR 分支并提交
       - name: Create Pull Request
         id: cpr
-        if: ${{ success() && (contains(steps.git_status.outputs.changed, 'true')) != true }}
-        run: echo "skip"  # 这行只是兜底；真正的变更检测在下一步的 git_status
-        shell: bash
-
-      # 变更检测（先做，避免不必要的 PR 步骤）
-      - name: Git status (detect changes)
-        id: git_status
-        run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create PR (bot/nightly)
-        if: ${{ steps.git_status.outputs.changed == 'true' }}
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          title: "nightly: NAV $(date -u +'%Y-%m-%d') & review $(date -u +'%Y-%m-%d')"
-          commit-message: "nightly: update reports on $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
-          body: |
-            This PR contains the nightly NAV csv and daily review markdown
-            generated automatically at $(date -u +'%Y-%m-%d %H:%M:%S') UTC.
-          branch: bot/nightly
+          branch: "bot/nightly-${{ github.run_id }}"
+          base: "main"
+          title: "nightly: NAV ${{ env.TZ }} $(date +'%Y-%m-%d') & review"
+          body: "This PR contains the nightly NAV data and review."
+          signoff: false
           delete-branch: true
-          add-paths: |
-            reports/nav/**
-            reports/daily/**
 
+      # 自动合并（如你仓库策略允许）。没有变更时此步会自然跳过。
       - name: Enable PR Auto-merge (squash)
-        if: ${{ steps.git_status.outputs.changed == 'true' }}
-        uses: peter-evans/enable-pull-request-automerge@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          pull-request-number: ${{ steps.create_pr.outputs.pull-request-number }}
-          merge-method: squash
-
-      # 兼容：如果 create-pull-request 没有 outputs（极少数情况下），
-      # 再做一次“无变更”友好提示，防止误判失败
-      - name: No changes fallback
-        if: ${{ steps.git_status.outputs.changed != 'true' }}
-        run: echo "No content changes. Skip PR."
+        if: steps.cpr.outputs.pull-request-number != ''
+        run: |
+          gh pr merge "${{ steps.cpr.outputs.pull-request-number }}" --squash --auto
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
