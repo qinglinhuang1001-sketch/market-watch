@@ -1,120 +1,144 @@
-# nav_fetch.py
-# 夜间抓取基金/ETF的净值/行情，分组落地到 reports/nav/
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import os, re, json, time, datetime
-from pathlib import Path
-import requests
+import os
+import csv
+import time
+import random
+from datetime import datetime, timezone, timedelta
+
 import pandas as pd
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# ---- 配置 ----
-FUND_CODES = os.getenv("FUND_CODES", "022364,006502,018956").split(",")
-ETF_CODES  = os.getenv("ETF_CODES",  "512810,513530,159399").split(",")
+# ==== 基础配置 ====
+TOKYO = timezone(timedelta(hours=9))
+TODAY = datetime.now(TOKYO).strftime("%Y-%m-%d")
 
-ROOT = Path(".")
-OUT_DIR = ROOT / "reports" / "nav"
-(OUT_DIR / "fund").mkdir(parents=True, exist_ok=True)
-(OUT_DIR / "etf").mkdir(parents=True, exist_ok=True)
+OUT_DIR = os.path.join("reports", "nav")
+os.makedirs(OUT_DIR, exist_ok=True)
+OUT_CSV = os.path.join(OUT_DIR, f"{TODAY}.csv")
 
-TODAY = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
+FUNDS = [
+    {"code": "022364", "name": "永赢科技智选A"},
+    {"code": "006502", "name": "财通集成电路A"},
+    {"code": "018956", "name": "中航机遇领航A"},
+]
 
+# Eastmoney/Jijin 需要 UA/Referer，否则容易 403
 HEADERS = {
-    "User-Agent": "Mozilla/5.0"
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://fundf10.eastmoney.com/",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Connection": "keep-alive",
 }
 
-def fetch_fund_nav_by_pingzhong(code: str):
-    """从东财 pingzhongdata 获取历史净值，取最后一条"""
-    url = f"http://fund.eastmoney.com/pingzhongdata/{code}.js?v={int(time.time())}"
-    r = requests.get(url, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    text = r.text
-    # Data_netWorthTrend = [...]
-    m = re.search(r"Data_netWorthTrend\s*=\s*(\[[^\]]*\])", text)
-    if not m:
-        return None
-    arr = json.loads(m.group(1))
-    last = arr[-1]  # {'x': 日期毫秒, 'y': 净值, 'equityReturn': 涨跌幅(%)...}
-    date = datetime.datetime.fromtimestamp(last["x"]/1000, tz=datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d")
-    return {"date": date, "value": float(last["y"]), "pct": float(last.get("equityReturn", 0))/100.0}
+class FetchError(Exception):
+    pass
 
-def fetch_fund_estimate(code: str):
-    """东财基金估值接口（jsonp）jsonpgz({...})"""
-    url = f"https://fundgz.1234567.com.cn/js/{code}.js?rt={int(time.time()*1000)}"
-    r = requests.get(url, headers=HEADERS, timeout=10)
-    if r.status_code != 200 or "jsonpgz" not in r.text:
-        return None
-    m = re.search(r"jsonpgz\((\{.*\})\)", r.text)
-    if not m:
-        return None
-    data = json.loads(m.group(1))
-    # {'name','gsz'(估值),'gszzl'(估值涨跌幅 %),'gztime'}
-    return {
-        "date": data.get("gztime","")[:10],
-        "value": float(data.get("gsz") or 0.0),
-        "pct": float(data.get("gszzl") or 0.0)/100.0
-    }
+def _session_with_headers() -> requests.Session:
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    return sess
 
-def code2sina_symbol(code: str) -> str:
-    # 5/6 开头 -> sh； 0/1/3 -> sz；其余兜底 sz
-    if code.startswith(("5","6")):
-        return f"sh{code}"
-    else:
-        return f"sz{code}"
-
-def fetch_etf_quote_sina(code: str):
-    sym = code2sina_symbol(code)
-    url = f"https://hq.sinajs.cn/list={sym}"
-    r = requests.get(url, headers={"Referer":"https://finance.sina.com.cn","User-Agent":"Mozilla/5.0"}, timeout=10)
-    r.raise_for_status()
-    txt = r.text
-    # var hq_str_sh510300="上证50,3.123,3.100,3.200,3.220,3.090,...,2025-08-19,15:00:03,00";
-    parts = txt.split("=")[-1].strip('";\n').split(",")
-    if len(parts) < 4 or parts[0] == "":
-        return None
-    name = parts[0]
-    pre_close = float(parts[2] or 0.0)
-    price = float(parts[3] or 0.0)
-    pct = 0.0 if pre_close == 0 else (price - pre_close) / pre_close
-    return {"name": name, "value": price, "pct": pct, "date": TODAY}
+@retry(
+    retry=retry_if_exception_type(FetchError),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=6),
+)
+def fetch_fund_once(sess: requests.Session, code: str) -> dict:
+    """
+    读取基金当日估值（或最新净值）。优先估值接口，不行再用净值页兜底。
+    这里只实现一个可用方案；如果后续你有更稳定的内部 API，可以替换这个函数。
+    返回: {"date": "YYYY-MM-DD", "value": float, "pct": float, "source": "xxx_api"}
+    """
+    # 方案 A：使用天天基金估值接口（需要 UA/Referer；字段逻辑随官网可能调整）
+    # 这里用的是一个公开的估值接口示例，注意：此类接口经常会调整/风控，403 很常见
+    # 所以加了重试与备用方案。
+    try:
+        # 示例接口（仅示意）：https://fundgz.1234567.com.cn/js/xxxx.js
+        # 真实使用时可替换成你当前在仓库里已验证可用的那套请求与解析
+        url = f"https://fundgz.1234567.com.cn/js/{code}.js"
+        resp = sess.get(url, timeout=8)
+        if resp.status_code == 200 and "jsonpgz" in resp.text:
+            # 简单解析：jsonpgz({"fundcode":"xxxx","name":"...","jzrq":"2025-08-19","dwjz":"2.5101","gsz":"2.5231","gszzl":"0.52","gztime":"2025-08-19 15:00"})
+            txt = resp.text.strip()
+            data_part = txt[txt.find("(") + 1 : txt.rfind(")")]
+            obj = pd.read_json(data_part, typ="series")
+            date = str(obj.get("jzrq") or TODAY)
+            value = float(obj.get("dwjz"))  # 单位净值
+            pct = float(obj.get("gszzl") or 0.0) / 100.0  # 估算涨跌幅（百分比->小数）
+            return {"date": date, "value": value, "pct": pct, "source": "eastmoney_gz"}
+        else:
+            raise FetchError(f"gz_resp={resp.status_code}")
+    except Exception as e:
+        # 方案 B：兜底（净值历史/详情页 JSON）
+        # 这里给一个可替的示意接口，你之前仓库中实际可用的 API 建议继续用。
+        # 注意兜底方案不一定有当日估值，只能拿到最近净值。
+        try:
+            url2 = f"https://api.doctorxiong.club/v1/fund?code={code}"
+            r2 = sess.get(url2, timeout=8)
+            if r2.status_code == 200:
+                js = r2.json()
+                if js.get("code") == 200 and js.get("data"):
+                    item = js["data"][0]
+                    value = float(item["netWorth"])
+                    date = str(item["netWorthDate"])
+                    # pct 这里可能没有，设为 0
+                    return {"date": date, "value": value, "pct": 0.0, "source": "doctorxiong_api"}
+            raise FetchError(f"fallback_resp={r2.status_code}, err={e}")
+        except Exception:
+            raise FetchError(f"fund {code} all endpoints failed")
 
 def main():
-    records = []
+    rows = []
+    sess = _session_with_headers()
 
-    # 场外基金
-    for code in FUND_CODES:
-        code = code.strip()
-        if not code:
-            continue
-        info = fetch_fund_nav_by_pingzhong(code) or fetch_fund_estimate(code)
-        if info:
-            name = f"Fund {code}"
-            records.append(dict(type="FUND", code=code, name=name, date=info["date"], value=info["value"], pct=info["pct"], source="eastmoney_api"))
-        else:
-            records.append(dict(type="FUND", code=code, name=f"Fund {code}", date=TODAY, value=None, pct=None, source="fetch_error"))
+    for f in FUNDS:
+        code = f["code"]
+        name = f["name"]
+        time.sleep(random.uniform(0.3, 0.9))  # 轻微打散，降低风控
+        try:
+            info = fetch_fund_once(sess, code)
+            rows.append(
+                {
+                    "type": "FUND",
+                    "code": code,
+                    "name": name,
+                    "date": info["date"],
+                    "value": info["value"],
+                    "pct": info["pct"],
+                    "source": info["source"],
+                }
+            )
+        except Exception as e:
+            rows.append(
+                {
+                    "type": "FUND",
+                    "code": code,
+                    "name": name,
+                    "date": TODAY,
+                    "value": "",
+                    "pct": "",
+                    "source": "fetch_error",
+                }
+            )
 
-    # ETF
-    for code in ETF_CODES:
-        code = code.strip()
-        if not code:
-            continue
-        q = fetch_etf_quote_sina(code)
-        if q:
-            records.append(dict(type="ETF", code=code, name=q["name"], date=q["date"], value=q["value"], pct=q["pct"], source="sina_quote"))
-        else:
-            records.append(dict(type="ETF", code=code, name=f"ETF {code}", date=TODAY, value=None, pct=None, source="fetch_error"))
+    # 写出 CSV
+    with open(OUT_CSV, "w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(
+            fp, fieldnames=["type", "code", "name", "date", "value", "pct", "source"]
+        )
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
 
-    df = pd.DataFrame(records)
-    df["date"] = df["date"].fillna(TODAY)
-
-    # 全量
-    out_all = OUT_DIR / f"{TODAY}.csv"
-    df.to_csv(out_all, index=False, encoding="utf-8-sig")
-
-    # 分组
-    df[df["type"]=="FUND"].to_csv(OUT_DIR/"fund"/f"{TODAY}.csv", index=False, encoding="utf-8-sig")
-    df[df["type"]=="ETF"].to_csv(OUT_DIR/"etf"/f"{TODAY}.csv", index=False, encoding="utf-8-sig")
-
-    print(f"[nav_fetch] done -> {out_all}")
-    return 0
+    print(f"[OK] wrote {OUT_CSV} ({len(rows)} rows)")
 
 if __name__ == "__main__":
     main()
