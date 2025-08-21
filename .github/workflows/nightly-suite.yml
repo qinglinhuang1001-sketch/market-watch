@@ -1,20 +1,27 @@
 name: nightly-suite
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    # 每天 21:00 UTC 触发（北京时间 +8 = 次日 05:00；东京 +9 = 次日 06:00）
-    - cron: "0 21 * * *"
+    # 每天 21:40 Asia/Tokyo 运行（= 12:40 UTC）
+    - cron: "40 12 * * *"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: write         # 允许提交代码、创建分支
+  pull-requests: write    # 允许创建/自动合并 PR
+
+concurrency:
+  group: nightly-suite
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Tokyo
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   fetch-and-review:
+    name: fetch-and-review
     runs-on: ubuntu-latest
-    env:
-      TZ: Asia/Shanghai
 
     steps:
       - name: Checkout repo
@@ -25,69 +32,75 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install requests pandas pytz
+          pip install -r requirements.txt
 
-      - name: Run NAV fetch
+      - name: Run nightly nav fetch + review
+        id: run_fetch
         run: |
+          echo "Start nav_fetch.py at $(date -u +'%F %T') UTC"
           python nav_fetch.py
+          echo "Done at $(date -u +'%F %T') UTC"
 
-      - name: Build daily review
-        run: |
-          python daily_review.py
+      # 可选：把今天产出的 CSV/MD 打包为构件，方便从 Actions 页面下载核对
+      - name: Upload artifacts (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-$(date -u +%Y%m%d)
+          path: |
+            reports/nav/*.csv
+            reports/daily/*.md
+          if-no-files-found: ignore
+          compression-level: 6
 
-      - name: Detect changes
-        id: detect
+      # 仅当有变更才创建 PR（避免 “No commits between main and bot/nightly”）
+      - name: Create Pull Request
+        id: cpr
+        if: ${{ success() && (contains(steps.git_status.outputs.changed, 'true')) != true }}
+        run: echo "skip"  # 这行只是兜底；真正的变更检测在下一步的 git_status
+        shell: bash
+
+      # 变更检测（先做，避免不必要的 PR 步骤）
+      - name: Git status (detect changes)
+        id: git_status
         run: |
-          git status --porcelain
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "changed=true"  >> $GITHUB_OUTPUT
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
           else
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Commit changes (if any)
-        if: steps.detect.outputs.changed == 'true'
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "nightly: NAV $(date -u +'%Y-%m-%d') & review $(date -u +'%Y-%m-%d')" || true
-
-      - name: Create Pull Request
-        if: steps.detect.outputs.changed == 'true'
+      - name: Create PR (bot/nightly)
+        if: ${{ steps.git_status.outputs.changed == 'true' }}
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          title: "nightly review ${{ github.run_id }}"
+          title: "nightly: NAV $(date -u +'%Y-%m-%d') & review $(date -u +'%Y-%m-%d')"
+          commit-message: "nightly: update reports on $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
           body: |
-            This PR contains nightly NAV data and review.
-            NAV date: $(date -u +'%Y-%m-%d')
-          branch: "bot/nightly-${{ github.run_id }}"
-          commit-message: "nightly: update NAV & daily review"
+            This PR contains the nightly NAV csv and daily review markdown
+            generated automatically at $(date -u +'%Y-%m-%d %H:%M:%S') UTC.
+          branch: bot/nightly
           delete-branch: true
-          labels: automated, nightly
+          add-paths: |
+            reports/nav/**
+            reports/daily/**
 
       - name: Enable PR Auto-merge (squash)
-        if: steps.detect.outputs.changed == 'true'
+        if: ${{ steps.git_status.outputs.changed == 'true' }}
         uses: peter-evans/enable-pull-request-automerge@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ steps.create_pr.outputs.pull-request-number }}
           merge-method: squash
 
-      - name: Collect artifacts
-        run: |
-          mkdir -p artifacts
-          if [ -d "reports" ]; then tar -czf artifacts/reports_$(date -u +%Y%m%d).tgz reports; fi
-          if [ -d "logs" ];    then tar -czf artifacts/logs_$(date -u +%Y%m%d).tgz    logs;    fi
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: nightly-artifacts-${{ github.run_id }}
-          path: artifacts
-          if-no-files-found: ignore
+      # 兼容：如果 create-pull-request 没有 outputs（极少数情况下），
+      # 再做一次“无变更”友好提示，防止误判失败
+      - name: No changes fallback
+        if: ${{ steps.git_status.outputs.changed != 'true' }}
+        run: echo "No content changes. Skip PR."
