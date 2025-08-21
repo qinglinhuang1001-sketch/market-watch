@@ -1,4 +1,4 @@
-name: nightly-nav
+name: nightly-suite  # 抓净值 + 复盘，一体化
 
 on:
   # 北京时间（CST, UTC+8）工作日 19:30 / 21:00 / 22:30 各跑一轮
@@ -13,11 +13,11 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: nightly-nav
+  group: nightly-suite
   cancel-in-progress: true
 
 jobs:
-  fetch-nav:
+  fetch-and-review:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -32,13 +32,16 @@ jobs:
           python-version: "3.10"
 
       - name: Install deps
-        run: pip install requests
+        run: |
+          pip install --upgrade pip
+          pip install requests
 
+      # ① 抓三只基金净值 -> reports/nav/<净值日>.csv
       - name: Run nav fetch
         run: |
           python nav_fetch.py
 
-      # 找到本轮生成的 NAV 文件（取最后一个）
+      # ② 识别本轮生成的 NAV 文件（取最新一个）
       - name: Detect NAV_DATE
         id: navdate
         shell: bash
@@ -46,7 +49,7 @@ jobs:
           set -e
           NAV_FILE=$(ls -1 reports/nav/*.csv | sort | tail -n1 || true)
           if [ -z "$NAV_FILE" ]; then
-            echo "No NAV csv produced; skip PR."
+            echo "No NAV csv produced; skip."
             echo "NAV_DATE=" >> $GITHUB_ENV
             exit 0
           fi
@@ -54,23 +57,44 @@ jobs:
           echo "NAV_DATE=$NAV_DATE" >> $GITHUB_ENV
           echo "Detected NAV file: $NAV_FILE"
 
-      # 以 PR 方式提交，避免直接 push main 的冲突
+      # ③ 生成当日复盘 -> reports/daily/<日期>.md
+      #    你的 daily_review.py 会读取最新 nav csv/日志并产出日报
+      - name: Run daily review
+        run: |
+          python daily_review.py
+
+      # ④ 识别本轮生成的日报文件（取最新一个）
+      - name: Detect REVIEW_DATE
+        id: reviewdate
+        shell: bash
+        run: |
+          set -e
+          REVIEW_FILE=$(ls -1 reports/daily/*.md | sort | tail -n1 || true)
+          if [ -z "$REVIEW_FILE" ]; then
+            echo "No daily review produced; continue with NAV only."
+            echo "REVIEW_DATE=" >> $GITHUB_ENV
+          else
+            REVIEW_DATE=$(basename "$REVIEW_FILE" .md)
+            echo "REVIEW_DATE=$REVIEW_DATE" >> $GITHUB_ENV
+            echo "Detected REVIEW file: $REVIEW_FILE"
+          fi
+
+      # ⑤ 用 PR 方式提交（避免 direct push 冲突），自动合并（squash）
       - name: Create Pull Request
-        if: env.NAV_DATE != ''
+        if: env.NAV_DATE != '' || env.REVIEW_DATE != ''
         id: cpr
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           add-paths: |
             reports/nav/*.csv
-          commit-message: "nav: ${{ env.NAV_DATE }} update"
-          title: "NAV update: ${{ env.NAV_DATE }}"
-          body: "Auto-created by nightly-nav workflow."
+            reports/daily/*.md
+          commit-message: "nightly: NAV ${{ env.NAV_DATE }} & review ${{ env.REVIEW_DATE }}"
+          title: "Nightly: NAV ${{ env.NAV_DATE }} & review ${{ env.REVIEW_DATE }}"
+          body: "Auto-created by nightly-suite workflow."
           branch: "bot/nightly-${{ github.run_id }}"
           base: "main"
 
-      # 开启 Auto‑merge（squash）
-      # 仓库需开启 Settings → General → Pull Requests → Enable auto-merge
       - name: Enable PR Auto-merge (squash)
         if: steps.cpr.outputs.pull-request-number != ''
         uses: peter-evans/enable-pull-request-automerge@v3
@@ -79,11 +103,13 @@ jobs:
           pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
           merge-method: squash
 
-      # 方便从 Actions 下载当轮 csv 进行核对
-      - name: Upload artifact (nav csv)
+      # ⑥ 产物：本轮 NAV CSV + 日报 MD
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nav-${{ github.run_id }}
-          path: reports/nav/*.csv
+          name: nightly-${{ github.run_id }}
+          path: |
+            reports/nav/*.csv
+            reports/daily/*.md
           if-no-files-found: ignore
