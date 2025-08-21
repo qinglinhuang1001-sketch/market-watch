@@ -1,144 +1,70 @@
 name: nightly-suite
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
   schedule:
-    # 每天 10:15 UTC 运行（= 日本时间 19:15，按需改）
-    - cron: "15 10 * * *"
-
-permissions:
-  contents: write
-  pull-requests: write
-
-concurrency:
-  group: nightly-suite
-  cancel-in-progress: false
+    # UTC 13:30 运行；东京+9 相当于 22:30。按需修改。
+    - cron: "30 13 * * *"
 
 jobs:
   fetch-and-review:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # 推送、建分支
+      pull-requests: write   # 建 PR、开自动合并
+
+    env:
+      # 给日报标题用的日期，代码里也可自己算；这里先占位
+      NAV_DATE: ${{ vars.NAV_DATE || '' }}
+      REVIEW_DATE: ${{ vars.REVIEW_DATE || '' }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas
+          pip install -r requirements.txt || true
 
-      # ---------------------------
-      # 1) 抓基金净值 + ETF 行情（分开写）
-      # ---------------------------
-      - name: Run nav fetch
-        id: run_nav
+      - name: Run nightly nav fetch + review
         run: |
-          echo ">>> python nav_fetch.py"
           python nav_fetch.py
-      
-      - name: Show reports tree (after fetch)
-        run: |
-          echo "=== tree of reports ==="
-          ls -lah reports || true
-          echo "=== tree of reports/nav ==="
-          ls -lah reports/nav || true
-          echo "=== tree of reports/quotes ==="
-          ls -lah reports/quotes || true
+          python daily_review.py
 
-      # 读取“最新”基金净值日期（用于 PR 标题，不影响逻辑）
-      - name: Detect NAV_DATE
-        id: navdate
-        shell: bash
-        run: |
-          NAV_DATE=""
-          if ls reports/nav/*.csv >/dev/null 2>&1; then
-            NAV_DATE="$(ls -1 reports/nav/*.csv | sort | tail -n1 | sed -E 's#.*/([0-9-]+)\.csv#\1#')"
-          fi
-          echo "NAV_DATE=${NAV_DATE}"
-          echo "NAV_DATE=${NAV_DATE}" >> $GITHUB_ENV
-          echo "nav_date=${NAV_DATE}" >> $GITHUB_OUTPUT
-
-      # ---------------------------
-      # 2) 生成当日复盘（存在就运行，不存在则跳过）
-      # ---------------------------
-      - name: Run daily review (if exists)
-        id: run_review
-        shell: bash
-        run: |
-          if [ -f daily_review.py ]; then
-            echo ">>> python daily_review.py"
-            python daily_review.py || true
-          else
-            echo "daily_review.py not found, skip."
-          fi
-
-      - name: Detect REVIEW_DATE
-        id: reviewdate
-        shell: bash
-        run: |
-          REVIEW_DATE=""
-          if ls reports/daily/*.md >/dev/null 2>&1; then
-            REVIEW_DATE="$(ls -1 reports/daily/*.md | sort | tail -n1 | sed -E 's#.*/([0-9-]+)\.md#\1#')"
-          fi
-          echo "REVIEW_DATE=${REVIEW_DATE}"
-          echo "REVIEW_DATE=${REVIEW_DATE}" >> $GITHUB_ENV
-          echo "review_date=${REVIEW_DATE}" >> $GITHUB_OUTPUT
-
-      # ---------------------------
-      # 3) 检测是否有变更（有变更才建 PR）
-      # ---------------------------
-      - name: Detect repository changes
-        id: diff
-        run: |
-          git add -A
-          if git diff --cached --quiet; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "No changes to commit."
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "There are changes."
-          fi
-
-      # ---------------------------
-      # 4) 创建 PR（自动 squash 合并）
-      # ---------------------------
-      - name: Create Pull Request
-        if: steps.diff.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          add-paths: |
-            reports/nav/*.csv
-            reports/quotes/*.csv
-            reports/daily/*.md
-          commit-message: "nightly: NAV ${{ env.NAV_DATE }} & review ${{ env.REVIEW_DATE }}"
-          title: "Nightly: NAV ${{ env.NAV_DATE }} & review ${{ env.REVIEW_DATE }}"
-          body: |
-            Auto-created by nightly-suite.
-            - NAV: ${{ env.NAV_DATE }}
-            - REVIEW: ${{ env.REVIEW_DATE }}
-          branch: "bot/nightly"
-          branch-suffix: "timestamp"   # 避免旧分支复用
-          delete-branch: true
-          merge-method: squash
-          auto-merge: true
-
-      # ---------------------------
-      # 5) 上传制品（即使无变更也上传）
-      # ---------------------------
-      - name: Upload artifacts
-        if: always()
+      # 可选：把当日盘中快照作为构件上传（文件名已避免冒号）
+      - name: Upload intraday quotes (optional)
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-${{ github.run_id }}
-          path: |
-            reports/nav/*.csv
-            reports/quotes/*.csv
-            reports/daily/*.md
+          name: quotes
+          path: quotes/*.csv
           if-no-files-found: ignore
+
+      # 只创建 PR（注意：不要在这里传 auto-merge/merge-method）
+      - name: Create Pull Request
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          add-paths: |
+            reports/nav/*.csv
+            reports/daily/*.md
+          branch: bot/nightly-${{ github.run_id }}
+          title: "nightly: NAV ${{ env.NAV_DATE }} & review ${{ env.REVIEW_DATE }}"
+          body:  "Auto generated by nightly-suite"
+          commit-message: "nightly: NAV & review"
+          delete-branch: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 启用自动合并（squash）
+      - name: Enable PR Auto-merge (squash)
+        if: steps.cpr.outputs.pull-request-number != ''
+        uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
+          merge-method: squash
