@@ -2,42 +2,65 @@ name: intraday-check
 
 on:
   workflow_dispatch:
+    inputs:
+      loops:
+        description: '循环次数(每次2分钟)'
+        required: false
+        default: '30'
   schedule:
-    # 例：周一至周五，UTC 0:10~7:10 每小时触发一次；你已有 2min×30 的循环，够用了
-    - cron: "10 0-7 * * 1-5"
+    # 工作日午盘例：01:30 UTC 开始(= 09:30 北京时间)，根据需要自行调整
+    - cron: "30 1 * * 1-5"
 
 jobs:
   run-check:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
+    timeout-minutes: 120
     env:
-      # 三层兜底：Secrets > Variables > 默认
-      TOTAL_ASSETS: ${{ secrets.TOTAL_ASSETS != '' && secrets.TOTAL_ASSETS || vars.TOTAL_ASSETS != '' && vars.TOTAL_ASSETS || '100000' }}
-      POSITION_PCT: ${{ vars.POSITION_PCT != '' && vars.POSITION_PCT || '0.10' }}   # 总资产里，用于“进攻仓”上限
-      ATTACK_PCT:   ${{ vars.ATTACK_PCT   != '' && vars.ATTACK_PCT   || '0.035' }}  # 单笔 3.5%（你设 3~4%）
-      SCKEY:        ${{ secrets.SCKEY }}  # Server酱，可为空
+      TZ: Asia/Shanghai
+
+      # ====== 监控清单 ======
+      FUND_CODES: "022364,006502,018956"
+      ETF_CODES:  "512810,513530,159399"
+
+      # ====== 价格/量能参数 ======
+      PULLBACK_MIN: "0.05"      # ETF 波段：回撤下限 5%
+      PULLBACK_MAX: "0.08"      # ETF 波段：回撤上限 8%
+      VOL_BREAKOUT: "1.8"       # 放量突破阈值：当前分钟推算 > 1.8 × 均量
+
+      # ====== 资金管理 ======
+      TOTAL_ASSETS: ""          # 为空时脚本默认 100000
+      ATTACK_PCT_FUNDS: "0.10"  # 场外基金进攻仓：单只占总资产 10%
+      ATTACK_PCT_ETF_MIN: "0.03"
+      ATTACK_PCT_ETF_MAX: "0.04"
+
+      # ====== 通知通道（Server酱 Turbo）======
+      SCT_KEY: ""               # 例如：SCUxxxxxxx（留空则仅打印日志）
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
+          python -m pip install requests pandas pytz
 
-      - name: Intraday loop (2min × 30)
+      - name: Intraday loop (2 min)
+        env:
+          LOOPS: ${{ github.event.inputs.loops }}
         run: |
-          echo "Start intraday loop at: $(date -u '+%F %T') UTC"
-          for i in $(seq 1 30); do
-            echo "== iteration ${i} =="
+          set -e
+          LOOPS=${LOOPS:-30}
+          echo "Start intraday loop at: $(date -u '+%Y-%m-%d %T') UTC"
+          i=1
+          while [ $i -le $LOOPS ]; do
+            echo "== iteration $i =="
             python check_once.py || true
             sleep 120
+            i=$((i+1))
           done
