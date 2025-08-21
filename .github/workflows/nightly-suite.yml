@@ -3,12 +3,12 @@ name: nightly-suite
 on:
   workflow_dispatch:
   schedule:
-    # 每天 21:00 UTC 触发（北京时间次日 05:00 / 东京 06:00）
+    # 每天 21:00 UTC 触发（北京时间 +8 = 次日 05:00；东京 +9 = 次日 06:00）
     - cron: "0 21 * * *"
 
 permissions:
-  contents: write          # 允许写入（提交/分支）
-  pull-requests: write     # 允许创建/合并 PR
+  contents: write
+  pull-requests: write
 
 jobs:
   fetch-and-review:
@@ -27,27 +27,19 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           python -m pip install requests pandas pytz
 
-      # ====== 运行你的脚本，生成 NAV & 日报 ======
       - name: Run NAV fetch
         run: |
-          echo ">>> run nav_fetch.py"
           python nav_fetch.py
 
-      - name: Run daily review
+      - name: Build daily review
         run: |
-          echo ">>> run daily_review.py"
-          if [ -f daily_review.py ]; then
-            python daily_review.py
-          else
-            echo "daily_review.py not found, skip."
-          fi
+          python daily_review.py
 
-      # ====== 检测是否有变更 ======
       - name: Detect changes
         id: detect
         run: |
@@ -58,19 +50,14 @@ jobs:
             echo "changed=false" >> $GITHUB_OUTPUT
           fi
 
-      # ====== 仅当有变更时，创建分支并提交 ======
       - name: Commit changes (if any)
         if: steps.detect.outputs.changed == 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # 格式化一个简短的 commit message
-          COMMIT_MSG="nightly: NAV $(date -u +'%Y-%m-%d') & review $(date -u +'%Y-%m-%d')"
           git add -A
-          git commit -m "$COMMIT_MSG" || true
+          git commit -m "nightly: NAV $(date -u +'%Y-%m-%d') & review $(date -u +'%Y-%m-%d')" || true
 
-      # ====== 仅当有变更时，开 PR（避免 push 冲突/fast-forward） ======
       - name: Create Pull Request
         if: steps.detect.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v6
@@ -79,15 +66,12 @@ jobs:
           title: "nightly review ${{ github.run_id }}"
           body: |
             This PR contains nightly NAV data and review.
-
-            - NAV date: $(date -u +'%Y-%m-%d')
-            - Runner:  ${{ github.actor }}
+            NAV date: $(date -u +'%Y-%m-%d')
           branch: "bot/nightly-${{ github.run_id }}"
           commit-message: "nightly: update NAV & daily review"
           delete-branch: true
           labels: automated, nightly
 
-      # ====== 仅当有 PR 时，自动合并（仓库需开启 Auto-merge） ======
       - name: Enable PR Auto-merge (squash)
         if: steps.detect.outputs.changed == 'true'
         uses: peter-evans/enable-pull-request-automerge@v3
@@ -95,17 +79,11 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           merge-method: squash
 
-      # ====== 上传产物，避免冒号引发路径非法 ======
       - name: Collect artifacts
         run: |
           mkdir -p artifacts
-          # 收集常见产物到一个安全目录（文件名不含冒号）
-          if [ -d "reports" ]; then
-            tar -czf artifacts/reports_$(date -u +%Y%m%d).tgz reports
-          fi
-          if [ -d "logs" ]; then
-            tar -czf artifacts/logs_$(date -u +%Y%m%d).tgz logs
-          fi
+          if [ -d "reports" ]; then tar -czf artifacts/reports_$(date -u +%Y%m%d).tgz reports; fi
+          if [ -d "logs" ];    then tar -czf artifacts/logs_$(date -u +%Y%m%d).tgz    logs;    fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
