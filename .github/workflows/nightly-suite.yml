@@ -3,53 +3,113 @@ name: nightly-suite
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 21 * * *"   # 每天 UTC 21 点 (北京时间 05:00)
+    # 每天 21:00 UTC 触发（北京时间次日 05:00 / 东京 06:00）
+    - cron: "0 21 * * *"
+
+permissions:
+  contents: write          # 允许写入（提交/分支）
+  pull-requests: write     # 允许创建/合并 PR
 
 jobs:
   fetch-and-review:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas
-          pip list   # 👉 打印确认依赖装好了
+          python -m pip install requests pandas pytz
 
-      - name: Run nightly nav fetch + review
+      # ====== 运行你的脚本，生成 NAV & 日报 ======
+      - name: Run NAV fetch
         run: |
-          which python
-          python --version
-          python -m pip list | grep requests
+          echo ">>> run nav_fetch.py"
           python nav_fetch.py
 
-      - name: Upload intraday quotes (optional)
-        if: success()
-        uses: actions/upload-artifact@v3
-        with:
-          name: intraday-quotes
-          path: quotes/*.csv
+      - name: Run daily review
+        run: |
+          echo ">>> run daily_review.py"
+          if [ -f daily_review.py ]; then
+            python daily_review.py
+          else
+            echo "daily_review.py not found, skip."
+          fi
 
+      # ====== 检测是否有变更 ======
+      - name: Detect changes
+        id: detect
+        run: |
+          git status --porcelain
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true"  >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ====== 仅当有变更时，创建分支并提交 ======
+      - name: Commit changes (if any)
+        if: steps.detect.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 格式化一个简短的 commit message
+          COMMIT_MSG="nightly: NAV $(date -u +'%Y-%m-%d') & review $(date -u +'%Y-%m-%d')"
+          git add -A
+          git commit -m "$COMMIT_MSG" || true
+
+      # ====== 仅当有变更时，开 PR（避免 push 冲突/fast-forward） ======
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v5
+        if: steps.detect.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: update nightly nav data"
-          branch: "auto/nightly-nav"
-          title: "Nightly NAV Update"
-          body: "This PR contains the latest NAV data from nightly run."
-          delete-branch: true
+          title: "nightly review ${{ github.run_id }}"
+          body: |
+            This PR contains nightly NAV data and review.
 
+            - NAV date: $(date -u +'%Y-%m-%d')
+            - Runner:  ${{ github.actor }}
+          branch: "bot/nightly-${{ github.run_id }}"
+          commit-message: "nightly: update NAV & daily review"
+          delete-branch: true
+          labels: automated, nightly
+
+      # ====== 仅当有 PR 时，自动合并（仓库需开启 Auto-merge） ======
       - name: Enable PR Auto-merge (squash)
-        uses: peter-evans/enable-pull-request-automerge@v2
+        if: steps.detect.outputs.changed == 'true'
+        uses: peter-evans/enable-pull-request-automerge@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           merge-method: squash
+
+      # ====== 上传产物，避免冒号引发路径非法 ======
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          # 收集常见产物到一个安全目录（文件名不含冒号）
+          if [ -d "reports" ]; then
+            tar -czf artifacts/reports_$(date -u +%Y%m%d).tgz reports
+          fi
+          if [ -d "logs" ]; then
+            tar -czf artifacts/logs_$(date -u +%Y%m%d).tgz logs
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-artifacts-${{ github.run_id }}
+          path: artifacts
+          if-no-files-found: ignore
